@@ -1,0 +1,21 @@
+[package]
+name = "adaption-code"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "A terminal coding agent powered by Adaption"
+
+[dependencies]
+anyhow = "1"
+cap-fs-ext = "4"
+cap-std = "4"
+clap = { version = "4", features = ["derive", "env"] }
+ctrlc = "3"
+ignore = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+rustix = { version = "1", features = ["fs", "process", "termios"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+similar = "2"
+tempfile = "3"
