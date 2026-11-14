@@ -1,11 +1,11 @@
 use std::fs::OpenOptions;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::Result;
 use rustix::termios::{QueueSelector, tcflush};
 
-use crate::terminal;
+use crate::terminal::{self, Palette, Tone};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -70,22 +70,34 @@ impl Action {
 impl Approvals {
     pub fn request(&mut self, action: Action, preview: &str) -> Result<bool> {
         if self.allowed.contains(&action) {
-            eprintln!(
-                "Allowed for this session: {}",
-                terminal::line(&action.label())
+            terminal::notice(
+                Tone::Info,
+                format_args!(
+                    "Allowed for this session: {}",
+                    terminal::line(&action.label())
+                ),
             );
             return Ok(true);
         }
         let Ok(mut tty) = OpenOptions::new().read(true).write(true).open("/dev/tty") else {
-            eprintln!(
-                "Denied: no controlling terminal for {}",
-                terminal::line(&action.label())
+            terminal::notice(
+                Tone::Action,
+                format_args!(
+                    "Denied: no controlling terminal for {}",
+                    terminal::line(&action.label())
+                ),
             );
             return Ok(false);
         };
         tcflush(&tty, QueueSelector::IFlush)?;
-        let mut input = BufReader::new(tty.try_clone()?);
-        let decision = prompt(&mut input, &mut tty, &action.label(), preview)?;
+        let mut input = terminal::TerminalInput::new(tty.try_clone()?);
+        let decision = prompt(
+            &mut tty,
+            &action.label(),
+            preview,
+            Palette::detect(true),
+            || terminal::read_interactive_line(&mut input),
+        )?;
         crate::tools::check_interrupt()?;
         Ok(self.record(action, decision))
     }
@@ -99,7 +111,7 @@ impl Approvals {
 
     pub fn show(&self) {
         if self.allowed.is_empty() {
-            eprintln!("No remembered approvals.");
+            terminal::notice(Tone::Info, "No remembered approvals.");
         }
         for action in &self.allowed {
             eprintln!("  {}", terminal::line(&action.label()));
@@ -112,30 +124,66 @@ impl Approvals {
 }
 
 fn prompt(
-    input: &mut impl BufRead,
     output: &mut impl Write,
     label: &str,
     preview: &str,
-) -> io::Result<Decision> {
-    writeln!(output, "\n{}", terminal::line(label))?;
-    if !preview.is_empty() {
-        writeln!(output, "{preview}")?;
+    palette: Palette,
+    mut read_choice: impl FnMut() -> Result<Option<String>>,
+) -> Result<Decision> {
+    let border = palette.paint(Tone::Info, "│");
+    writeln!(
+        output,
+        "\n{} {}",
+        palette.paint(Tone::Info, "╭─"),
+        palette.paint(Tone::Action, "Approval required")
+    )?;
+    writeln!(
+        output,
+        "{border} {}",
+        palette.paint(Tone::Text, terminal::line(label))
+    )?;
+    for line in preview.lines() {
+        let text = terminal::visible(line);
+        let text = if line.starts_with('+') {
+            palette.paint(Tone::Info, text)
+        } else if line.starts_with('-') {
+            palette.paint(Tone::Action, text)
+        } else {
+            text
+        };
+        writeln!(output, "{border} {text}")?;
     }
     writeln!(
         output,
-        "  1. Always Allow (this exact action, for this session)\n  2. Allow This Time\n  3. Deny"
+        "{border} {}",
+        palette.paint(
+            Tone::Text,
+            "1. Always Allow (this exact action, for this session)"
+        )
     )?;
+    writeln!(
+        output,
+        "{border} {}",
+        palette.paint(Tone::Text, "2. Allow This Time")
+    )?;
+    writeln!(
+        output,
+        "{border} {}",
+        palette.paint(Tone::Action, "3. Deny")
+    )?;
+    writeln!(output, "{}", palette.paint(Tone::Info, "╰─"))?;
     loop {
-        write!(output, "Choice [3]: ")?;
+        write!(output, "{}", palette.paint(Tone::Action, "Choice [3]: "))?;
         output.flush()?;
-        let Some(line) = terminal::read_line(input)? else {
-            return Ok(Decision::Denied);
-        };
-        match line.trim() {
-            "1" => return Ok(Decision::Always),
-            "2" => return Ok(Decision::Once),
-            "3" | "" => return Ok(Decision::Denied),
-            _ => writeln!(output, "Enter 1, 2, or 3.")?,
+        match read_choice()?.as_deref().map(str::trim) {
+            Some("1") => return Ok(Decision::Always),
+            Some("2") => return Ok(Decision::Once),
+            Some("3" | "") | None => return Ok(Decision::Denied),
+            _ => writeln!(
+                output,
+                "{}",
+                palette.paint(Tone::Action, "Enter 1, 2, or 3.")
+            )?,
         }
     }
 }
@@ -196,7 +244,11 @@ mod tests {
             ("yes\n", Decision::Denied),
         ] {
             let mut output = Vec::new();
-            let result = prompt(&mut input.as_bytes(), &mut output, "label", "preview").unwrap();
+            let mut input = input.as_bytes();
+            let result = prompt(&mut output, "label", "preview", Palette::default(), || {
+                Ok(terminal::read_line(&mut input)?)
+            })
+            .unwrap();
             assert_eq!(result, decision);
             let mut approvals = Approvals::default();
             let action = command(&["status"]);

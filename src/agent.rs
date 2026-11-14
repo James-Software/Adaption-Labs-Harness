@@ -177,7 +177,7 @@ impl<'a> Agent<'a> {
             );
             for (id, name, args) in calls {
                 tools::check_interrupt()?;
-                let result = tools::run(name, args, self.workspace, &mut self.approvals);
+                let result = tools::run(name, args, self.workspace, &mut self.approvals)?;
                 turn.push(json!({"type": "function_call_output", "call_id": id, "output": result.to_string()}));
             }
         }

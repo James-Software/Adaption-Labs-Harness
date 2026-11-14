@@ -6,7 +6,8 @@ mod terminal;
 mod tools;
 mod workspace;
 
-use std::io::{self, IsTerminal, StdinLock, Write};
+use std::fs::File;
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -16,7 +17,7 @@ use clap::{Parser, Subcommand};
 use adaption::Client;
 use agent::Agent;
 use settings::{Config, Connection, Settings};
-use terminal::{line, visible};
+use terminal::{ExitRequested, Interrupted, Palette, Tone, line, notice, visible};
 use workspace::Workspace;
 
 const LOGO: [&str; 3] = [
@@ -66,8 +67,12 @@ enum Mode {
 fn main() -> ExitCode {
     match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
+        Err(error) if error.is::<ExitRequested>() || error.is::<Interrupted>() => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("Error: {}", visible(&format!("{error:#}")));
+            notice(
+                Tone::Action,
+                format_args!("Error: {}", visible(&format!("{error:#}"))),
+            );
             ExitCode::FAILURE
         }
     }
@@ -122,28 +127,28 @@ fn run(cli: Cli) -> Result<()> {
         return connect(&connection, &workspace)?.run(&prompt, &mut io::stdout().lock());
     }
 
-    let mut input = io::stdin().lock();
+    let mut input = terminal::TerminalInput::new(File::from(rustix::io::dup(io::stdin())?));
     let mut output = io::stderr().lock();
+    let palette = Palette::stderr();
     let width = rustix::termios::tcgetwinsize(&input)
         .ok()
         .map(|size| usize::from(size.ws_col))
         .filter(|&width| width > 0)
         .unwrap_or(80);
-    write_banner(
-        &mut output,
-        width,
-        banner_colors(io::stderr().is_terminal()),
-    )?;
+    write_banner(&mut output, width, palette)?;
     writeln!(
         output,
-        "Workspace: {}",
+        "{} {}",
+        palette.paint(Tone::Info, "Workspace:"),
         line(&workspace.root().display().to_string())
     )?;
     writeln!(
         output,
-        "Commands: /settings, /help, /clear, /permissions, /revoke, /quit"
+        "{} {}, /help, /clear, /permissions, /revoke, /quit",
+        palette.paint(Tone::Info, "Commands:"),
+        palette.paint(Tone::Action, "/settings")
     )?;
-    if settings.key().is_none() && settings::setup_popup(&mut input, &mut output)? {
+    if settings.key().is_none() && settings::setup_popup(&mut input, &mut output, palette)? {
         edit_settings(
             &mut settings,
             &config,
@@ -151,27 +156,27 @@ fn run(cli: Cli) -> Result<()> {
             &mut output,
             model,
             memory,
-        );
+        )?;
     }
     drop(output);
 
     let mut session: Option<(Connection, Agent<'_>)> = None;
     loop {
-        eprint!("\nadapt> ");
+        tools::reset_interrupt();
+        eprint!("\n{}", palette.paint(Tone::Action, "adapt> "));
         io::stderr().flush()?;
-        let Some(prompt) = terminal::read_line(&mut input)? else {
+        let Some(prompt) = terminal::read_interactive_line(&mut input)? else {
             break;
         };
         match prompt.trim() {
             "" => {}
-            "/quit" | "/exit" => break,
             "/help" => eprintln!(
                 "Enter a coding task or ask a follow-up.\n\
                  /settings configures Adaption\n\
                  /clear clears the conversation\n\
                  /permissions shows remembered approvals\n\
                  /revoke clears remembered approvals\n\
-                 /quit exits"
+                 /quit, quit, exit, or Ctrl+C exits"
             ),
             "/settings" => {
                 edit_settings(
@@ -181,32 +186,35 @@ fn run(cli: Cli) -> Result<()> {
                     &mut io::stderr().lock(),
                     model,
                     memory,
-                );
+                )?;
                 if let Some((previous, _)) = &session
                     && settings.connection(model, memory).ok().flatten().as_ref() != Some(previous)
                 {
                     session = None;
-                    eprintln!("A new conversation will use the updated connection.");
+                    notice(
+                        Tone::Info,
+                        "A new conversation will use the updated connection.",
+                    );
                 }
             }
             "/clear" => {
                 if let Some((_, agent)) = &mut session {
                     agent.clear_history();
                 }
-                eprintln!("Conversation cleared.");
+                notice(Tone::Info, "Conversation cleared.");
             }
             "/permissions" => {
                 if let Some((_, agent)) = &session {
                     agent.show_permissions();
                 } else {
-                    eprintln!("No remembered approvals.");
+                    notice(Tone::Info, "No remembered approvals.");
                 }
             }
             "/revoke" => {
                 if let Some((_, agent)) = &mut session {
                     agent.revoke_permissions();
                 }
-                eprintln!("Remembered approvals cleared.");
+                notice(Tone::Info, "Remembered approvals cleared.");
             }
             _ => {
                 let result = (|| -> Result<()> {
@@ -215,7 +223,7 @@ fn run(cli: Cli) -> Result<()> {
                         .context(SETUP_REQUIRED)?;
                     if session.is_none() {
                         let agent = connect(&connection, &workspace)?;
-                        eprintln!("Model: {}", line(agent.model()));
+                        notice(Tone::Info, format_args!("Model: {}", line(agent.model())));
                         session = Some((connection, agent));
                     }
                     if let Some((_, agent)) = &mut session {
@@ -224,7 +232,20 @@ fn run(cli: Cli) -> Result<()> {
                     Ok(())
                 })();
                 if let Err(error) = result {
-                    eprintln!("Error: {}", visible(&format!("{error:#}")));
+                    if error.is::<ExitRequested>() {
+                        return Err(error);
+                    }
+                    if error.is::<Interrupted>() {
+                        notice(
+                            Tone::Action,
+                            "Interrupted. Press Ctrl+C again to exit, or enter a new task.",
+                        );
+                    } else {
+                        notice(
+                            Tone::Action,
+                            format_args!("Error: {}", visible(&format!("{error:#}"))),
+                        );
+                    }
                 }
             }
         }
@@ -235,11 +256,7 @@ fn run(cli: Cli) -> Result<()> {
 const SETUP_REQUIRED: &str =
     "Adaption is unconfigured. Run adapt and open /settings to add an API key.";
 
-fn write_banner(
-    output: &mut impl Write,
-    width: usize,
-    colors: Option<[&str; 3]>,
-) -> io::Result<()> {
+fn write_banner(output: &mut impl Write, width: usize, palette: Palette) -> io::Result<()> {
     writeln!(output)?;
     if LOGO
         .iter()
@@ -250,41 +267,12 @@ fn write_banner(
             if index > 0 {
                 writeln!(output)?;
             }
-            if let Some(colors) = colors {
-                writeln!(output, "{}{row}\x1b[39m", colors[index])?;
-            } else {
-                writeln!(output, "{row}")?;
-            }
+            let tone = [Tone::Info, Tone::Text, Tone::Action][index];
+            writeln!(output, "{}", palette.paint(tone, row))?;
         }
         writeln!(output)?;
     }
-    writeln!(output, "Adapt")
-}
-
-fn banner_colors(is_terminal: bool) -> Option<[&'static str; 3]> {
-    let term = std::env::var("TERM").unwrap_or_default();
-    if !is_terminal
-        || term == "dumb"
-        || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
-    {
-        return None;
-    }
-
-    // The blue, lavender, and rose accents are from Adaption's homepage stylesheet.
-    let color_term = std::env::var("COLORTERM").unwrap_or_default();
-    Some(
-        if color_term == "truecolor" || color_term == "24bit" || term.ends_with("-direct") {
-            [
-                "\x1b[38;2;73;134;180m",
-                "\x1b[38;2;169;186;209m",
-                "\x1b[38;2;218;167;210m",
-            ]
-        } else if term.contains("256color") {
-            ["\x1b[38;5;67m", "\x1b[38;5;146m", "\x1b[38;5;182m"]
-        } else {
-            ["\x1b[34m", "\x1b[36m", "\x1b[35m"]
-        },
-    )
+    writeln!(output, "{}", palette.paint(Tone::Text, "Adapt"))
 }
 
 fn connect<'a>(connection: &Connection, workspace: &'a Workspace) -> Result<Agent<'a>> {
@@ -299,12 +287,20 @@ fn connect<'a>(connection: &Connection, workspace: &'a Workspace) -> Result<Agen
 fn edit_settings(
     settings: &mut Settings,
     config: &Config,
-    input: &mut StdinLock<'_>,
+    input: &mut terminal::TerminalInput,
     output: &mut impl Write,
     model: Option<&str>,
     memory: Option<bool>,
-) {
-    if let Err(error) = settings::edit(settings, config, input, output, model, memory) {
-        eprintln!("Error: {}", visible(&format!("{error:#}")));
+) -> Result<()> {
+    match settings::edit(settings, config, input, output, model, memory) {
+        Err(error) if error.is::<ExitRequested>() || error.is::<Interrupted>() => {
+            return Err(error);
+        }
+        Err(error) => notice(
+            Tone::Action,
+            format_args!("Error: {}", visible(&format!("{error:#}"))),
+        ),
+        Ok(()) => {}
     }
+    Ok(())
 }

@@ -9,7 +9,8 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{Mode, OFlags, open};
 use serde::{Deserialize, Serialize};
 
-use crate::{adaption::Client, terminal, tools};
+use crate::terminal::{Interrupted, Palette, Tone};
+use crate::{adaption::Client, terminal};
 
 pub const DEFAULT_MODEL: &str = "qwen3.5-397b";
 const MAX_SETTINGS: u64 = 16 * 1024;
@@ -175,19 +176,46 @@ fn valid_key(key: &str) -> bool {
     !key.is_empty() && key.len() <= 2048 && key.bytes().all(|byte| byte.is_ascii_graphic())
 }
 
-pub fn setup_popup(input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
-    writeln!(output, "\n╭─ Adapt setup ────────────────────────────╮")?;
-    writeln!(output, "│ Add your Adaption API key in /settings.  │")?;
-    writeln!(output, "│ 1. Open /settings     2. Later            │")?;
-    writeln!(output, "╰──────────────────────────────────────────╯")?;
+pub fn setup_popup(
+    input: &mut (impl BufRead + AsFd),
+    output: &mut impl Write,
+    palette: Palette,
+) -> Result<bool> {
+    writeln!(
+        output,
+        "\n{} {}",
+        palette.paint(Tone::Info, "╭─"),
+        palette.paint(Tone::Text, "Adapt setup")
+    )?;
+    writeln!(
+        output,
+        "{} Add your Adaption API key in {}.",
+        palette.paint(Tone::Info, "│"),
+        palette.paint(Tone::Action, "/settings")
+    )?;
+    writeln!(
+        output,
+        "{} {}     {}",
+        palette.paint(Tone::Info, "│"),
+        palette.paint(Tone::Action, "1. Open /settings"),
+        palette.paint(Tone::Text, "2. Later")
+    )?;
+    writeln!(output, "{}", palette.paint(Tone::Info, "╰─"))?;
     loop {
-        write!(output, "Choose [1]: ")?;
+        write!(output, "{}", palette.paint(Tone::Action, "Choose [1]: "))?;
         output.flush()?;
-        match terminal::read_line(input)?.as_deref().map(str::trim) {
-            Some("" | "1" | "/settings") => return Ok(true),
-            Some("2") | None => return Ok(false),
-            _ => writeln!(output, "Enter 1 or 2.")?,
+        if let Some(choice) = setup_choice(terminal::read_interactive_line(input)?.as_deref()) {
+            return Ok(choice);
         }
+        writeln!(output, "{}", palette.paint(Tone::Action, "Enter 1 or 2."))?;
+    }
+}
+
+fn setup_choice(input: Option<&str>) -> Option<bool> {
+    match input.map(str::trim) {
+        Some("" | "1" | "/settings") => Some(true),
+        Some("2") | None => Some(false),
+        _ => None,
     }
 }
 
@@ -199,6 +227,7 @@ pub fn edit(
     model_override: Option<&str>,
     memory_override: Option<bool>,
 ) -> Result<()> {
+    let palette = Palette::stderr();
     let mut draft = settings.clone();
     loop {
         let model = draft.model.as_deref().unwrap_or(DEFAULT_MODEL);
@@ -210,43 +239,75 @@ pub fn edit(
         } else {
             "required"
         };
-        writeln!(output, "\n╭─ /settings")?;
-        writeln!(output, "│ 1. API key          {key_status}")?;
-        writeln!(output, "│ 2. Model or stack   {}", terminal::line(model))?;
+        let border = palette.paint(Tone::Info, "│");
         writeln!(
             output,
-            "│ 3. Agentic memory   {}",
+            "\n{} {}",
+            palette.paint(Tone::Info, "╭─"),
+            palette.paint(Tone::Text, "/settings")
+        )?;
+        let key_tone = if key_status == "required" {
+            Tone::Action
+        } else {
+            Tone::Text
+        };
+        writeln!(
+            output,
+            "{border} {}          {}",
+            palette.paint(key_tone, "1. API key"),
+            palette.paint(key_tone, key_status)
+        )?;
+        writeln!(
+            output,
+            "{border} {}   {}",
+            palette.paint(Tone::Text, "2. Model or stack"),
+            terminal::line(model)
+        )?;
+        writeln!(
+            output,
+            "{border} {}   {}",
+            palette.paint(Tone::Text, "3. Agentic memory"),
             memory_label(draft.agentic_memory)
         )?;
-        writeln!(output, "│ 4. List available models")?;
-        writeln!(output, "│ 5. Save and return")?;
-        writeln!(output, "│ 0. Cancel")?;
+        writeln!(
+            output,
+            "{border} {}",
+            palette.paint(Tone::Text, "4. List available models")
+        )?;
+        writeln!(
+            output,
+            "{border} {}",
+            palette.paint(Tone::Action, "5. Save and return")
+        )?;
+        writeln!(output, "{border} 0. Cancel")?;
         if let Some(model) = model_override {
             writeln!(
                 output,
-                "│ Session model override: {}",
-                terminal::line(model)
+                "{border} Session model override: {}",
+                palette.paint(Tone::Info, terminal::line(model))
             )?;
         }
         if let Some(memory) = memory_override {
             writeln!(
                 output,
-                "│ Session memory override: {}",
-                memory_label(Some(memory))
+                "{border} Session memory override: {}",
+                palette.paint(Tone::Info, memory_label(Some(memory)))
             )?;
         }
-        writeln!(output, "╰─")?;
+        writeln!(output, "{}", palette.paint(Tone::Info, "╰─"))?;
 
-        write!(output, "Choose: ")?;
+        write!(output, "{}", palette.paint(Tone::Action, "Choose: "))?;
         output.flush()?;
-        match terminal::read_line(input)?.as_deref().map(str::trim) {
+        match terminal::read_interactive_line(input)?
+            .as_deref()
+            .map(str::trim)
+        {
             Some("1") => {
                 writeln!(output, "{KEY_HELP}")?;
-                tools::reset_interrupt();
                 match terminal::read_hidden_line(
                     input,
                     output,
-                    "API key (input hidden, Enter to keep): ",
+                    &palette.paint(Tone::Action, "API key (input hidden, Enter to keep): "),
                 )? {
                     Some(key) if !key.trim().is_empty() => {
                         let key = key.trim();
@@ -255,7 +316,11 @@ pub fn edit(
                         } else {
                             writeln!(
                                 output,
-                                "Invalid key format. Paste the key from Adaption Settings."
+                                "{}",
+                                palette.paint(
+                                    Tone::Action,
+                                    "Invalid key format. Paste the key from Adaption Settings."
+                                )
                             )?;
                         }
                     }
@@ -265,16 +330,24 @@ pub fn edit(
             Some("2") => {
                 write!(
                     output,
-                    "Adaption model ID or stack:<slug> (Enter to keep): "
+                    "{}",
+                    palette.paint(
+                        Tone::Action,
+                        "Adaption model ID or stack:<slug> (Enter to keep): "
+                    )
                 )?;
                 output.flush()?;
-                if let Some(model) = terminal::read_line(input)? {
+                if let Some(model) = terminal::read_interactive_line(input)? {
                     let model = model.trim();
                     if model.is_empty() {
                         continue;
                     }
                     if let Err(error) = validate_model(model) {
-                        writeln!(output, "{}", terminal::line(&error.to_string()))?;
+                        writeln!(
+                            output,
+                            "{}",
+                            palette.paint(Tone::Action, terminal::line(&error.to_string()))
+                        )?;
                         continue;
                     }
                     draft.model = Some(model.to_owned());
@@ -285,31 +358,49 @@ pub fn edit(
                     output,
                     "For an inference stack, enable memory, disable it, or use the stack's setting."
                 )?;
-                write!(output, "[1] On  [2] Off  [3] Stack default  [Enter] Keep: ")?;
+                write!(
+                    output,
+                    "{}",
+                    palette.paint(
+                        Tone::Action,
+                        "[1] On  [2] Off  [3] Stack default  [Enter] Keep: "
+                    )
+                )?;
                 output.flush()?;
-                match terminal::read_line(input)?.as_deref().map(str::trim) {
+                match terminal::read_interactive_line(input)?
+                    .as_deref()
+                    .map(str::trim)
+                {
                     Some("1") => draft.agentic_memory = Some(true),
                     Some("2") => draft.agentic_memory = Some(false),
                     Some("3") => draft.agentic_memory = None,
                     Some("") | None => {}
-                    _ => writeln!(output, "Enter 1, 2, or 3.")?,
+                    _ => writeln!(
+                        output,
+                        "{}",
+                        palette.paint(Tone::Action, "Enter 1, 2, or 3.")
+                    )?,
                 }
             }
-            Some("4") => show_models(&draft, output)?,
+            Some("4") => show_models(&draft, output, palette)?,
             Some("5") => {
                 if draft.key().is_none() {
-                    writeln!(output, "Add an API key with option 1 before saving.")?;
+                    writeln!(
+                        output,
+                        "{}",
+                        palette.paint(Tone::Action, "Add an API key with option 1 before saving.")
+                    )?;
                     continue;
                 }
                 if &draft != settings || !config.path().exists() {
                     config.save(&draft)?;
                     *settings = draft;
                 }
-                writeln!(output, "Settings saved.")?;
+                writeln!(output, "{}", palette.paint(Tone::Info, "Settings saved."))?;
                 return Ok(());
             }
             Some("0") | None => return Ok(()),
-            _ => writeln!(output, "Enter 0–5.")?,
+            _ => writeln!(output, "{}", palette.paint(Tone::Action, "Enter 0–5."))?,
         }
     }
 }
@@ -322,21 +413,34 @@ fn memory_label(memory: Option<bool>) -> &'static str {
     }
 }
 
-fn show_models(settings: &Settings, output: &mut impl Write) -> Result<()> {
+fn show_models(settings: &Settings, output: &mut impl Write, palette: Palette) -> Result<()> {
     let Some(key) = settings.key() else {
-        writeln!(output, "Add an API key with option 1 first.")?;
+        writeln!(
+            output,
+            "{}",
+            palette.paint(Tone::Action, "Add an API key with option 1 first.")
+        )?;
         return Ok(());
     };
     match Client::new(&key).and_then(|client| client.models()) {
-        Ok(models) if models.is_empty() => writeln!(output, "No models available to this key.")?,
+        Ok(models) if models.is_empty() => writeln!(
+            output,
+            "{}",
+            palette.paint(Tone::Action, "No models available to this key.")
+        )?,
         Ok(models) => {
             for model in models {
                 writeln!(output, "  {}", terminal::line(&model))?;
             }
         }
+        Err(error) if error.is::<Interrupted>() => return Err(error),
         Err(_) => writeln!(
             output,
-            "Could not list models. Check your API key and connection."
+            "{}",
+            palette.paint(
+                Tone::Action,
+                "Could not list models. Check your API key and connection."
+            )
         )?,
     }
     Ok(())
@@ -375,13 +479,8 @@ mod tests {
 
     #[test]
     fn popup_accepts_default_and_later() {
-        let mut output = Vec::new();
-        assert!(setup_popup(&mut b"\n".as_slice(), &mut output).unwrap());
-        assert!(!setup_popup(&mut b"2\n".as_slice(), &mut output).unwrap());
-        assert!(
-            String::from_utf8(output)
-                .unwrap()
-                .contains("Open /settings")
-        );
+        assert_eq!(setup_choice(Some("")), Some(true));
+        assert_eq!(setup_choice(Some("2")), Some(false));
+        assert_eq!(setup_choice(Some("9")), None);
     }
 }

@@ -16,7 +16,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::approval::{Action, Approvals};
-use crate::{terminal, workspace::Workspace};
+use crate::{
+    terminal::{self, ExitRequested, Interrupted, Tone},
+    workspace::Workspace,
+};
 
 const MAX_CAPTURE: u64 = 8 * 1024;
 const MAX_CAPTURE_ON_DISK: u64 = 4 * 1024 * 1024;
@@ -33,7 +36,9 @@ pub fn reset_interrupt() {
 }
 
 pub fn check_interrupt() -> Result<()> {
-    ensure!(!INTERRUPTED.load(Ordering::SeqCst), "interrupted");
+    if INTERRUPTED.load(Ordering::SeqCst) {
+        return Err(Interrupted.into());
+    }
     Ok(())
 }
 
@@ -165,11 +170,18 @@ struct CommandArgs {
     cwd: String,
 }
 
-pub fn run(name: &str, args: &str, ws: &Workspace, approvals: &mut Approvals) -> Value {
-    eprintln!("[{}]", terminal::line(name));
+pub fn run(name: &str, args: &str, ws: &Workspace, approvals: &mut Approvals) -> Result<Value> {
+    terminal::notice(Tone::Info, format_args!("[{}]", terminal::line(name)));
     match execute(name, args, ws, approvals) {
-        Ok(result) => result,
-        Err(error) => json!({"status": "error", "message": format!("{error:#}")}),
+        Ok(result) => Ok(result),
+        Err(error) if error.is::<Interrupted>() || error.is::<ExitRequested>() => Err(error),
+        Err(error) => {
+            terminal::notice(
+                Tone::Action,
+                format_args!("Tool error: {}", terminal::visible(&format!("{error:#}"))),
+            );
+            Ok(json!({"status": "error", "message": format!("{error:#}")}))
+        }
     }
 }
 
@@ -394,12 +406,16 @@ fn spawn(program: &Path, argv0: &str, args: &[String], cwd: &Path) -> Result<Val
     if !stderr.is_empty() {
         eprintln!("{}", terminal::visible(&stderr));
     }
-    eprintln!(
-        "Command: {}",
-        reason.map_or_else(|| status.to_string(), str::to_owned)
+    let succeeded = reason.is_none() && status.success();
+    terminal::notice(
+        if succeeded { Tone::Info } else { Tone::Action },
+        format_args!(
+            "Command: {}",
+            reason.map_or_else(|| status.to_string(), str::to_owned)
+        ),
     );
     Ok(json!({
-        "status": if reason.is_none() && status.success() { "ok" } else { "error" },
+        "status": if succeeded { "ok" } else { "error" },
         "exit_code": status.code(), "reason": reason, "stdout": stdout, "stderr": stderr
     }))
 }

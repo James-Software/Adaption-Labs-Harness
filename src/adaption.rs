@@ -1,17 +1,17 @@
-use std::io::{BufRead, BufReader, Read};
+use std::future::Future;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
-use reqwest::blocking::{Client as Http, RequestBuilder, Response as HttpResponse};
 use reqwest::header::{AUTHORIZATION, HeaderValue};
+use reqwest::{Client as Http, RequestBuilder, Response as HttpResponse};
 use serde::Deserialize;
 use serde_json::Value;
 
 const API: &str = "https://api.prod.adaptionlabs.ai/api/v1";
-const MAX_EVENT: u64 = 2 * 1024 * 1024;
 
 pub struct Client {
     http: Http,
+    runtime: tokio::runtime::Runtime,
     base: String,
     auth: HeaderValue,
 }
@@ -45,6 +45,9 @@ impl Client {
             HeaderValue::from_str(&format!("Bearer {key}")).context("invalid ADAPTION_API_KEY")?;
         auth.set_sensitive(true);
         Ok(Self {
+            runtime: tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?,
             http: Http::builder()
                 .connect_timeout(Duration::from_secs(15))
                 .timeout(Duration::from_secs(180))
@@ -56,16 +59,21 @@ impl Client {
     }
 
     pub fn models(&self) -> Result<Vec<String>> {
-        let response = self.send(self.http.get(format!("{}/models", self.base)))?;
-        let mut models: Vec<_> = response
-            .json::<ModelList>()?
-            .data
-            .into_iter()
-            .map(|model| model.id)
-            .collect();
-        models.sort_unstable();
-        models.dedup();
-        Ok(models)
+        self.run(async {
+            let response = self
+                .send(self.http.get(format!("{}/models", self.base)))
+                .await?;
+            let mut models: Vec<_> = response
+                .json::<ModelList>()
+                .await?
+                .data
+                .into_iter()
+                .map(|model| model.id)
+                .collect();
+            models.sort_unstable();
+            models.dedup();
+            Ok(models)
+        })
     }
 
     pub fn respond(
@@ -73,39 +81,61 @@ impl Client {
         body: &Value,
         mut on_text: impl FnMut(&str) -> Result<()>,
     ) -> Result<Response> {
-        let response = self.send(
-            self.http
-                .post(format!("{}/responses", self.base))
-                .header("Accept", "text/event-stream")
-                .json(body),
-        )?;
-        let content_type = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or_default();
-        if content_type.starts_with("application/json") {
-            return completed(&serde_json::from_reader(response.take(MAX_EVENT + 1))?);
-        }
-        ensure!(
-            content_type.starts_with("text/event-stream"),
-            "expected an Adaption event stream"
-        );
-        stream(BufReader::new(response), &mut on_text)
+        self.run(async {
+            let mut response = self
+                .send(
+                    self.http
+                        .post(format!("{}/responses", self.base))
+                        .header("Accept", "text/event-stream")
+                        .json(body),
+                )
+                .await?;
+            let content_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if content_type.starts_with("application/json") {
+                let body = read_body(response, MAX_EVENT).await?;
+                return completed(&serde_json::from_slice(&body)?);
+            }
+            ensure!(
+                content_type.starts_with("text/event-stream"),
+                "expected an Adaption event stream"
+            );
+            let mut stream = EventStream::default();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .context("reading Adaption event stream")?
+            {
+                if let Some(response) = stream.push(&chunk, &mut on_text)? {
+                    return Ok(response);
+                }
+            }
+            stream
+                .push(b"\n\n", &mut on_text)?
+                .context("Adaption stream ended before a completed response")
+        })
     }
 
-    fn send(&self, request: RequestBuilder) -> Result<HttpResponse> {
+    fn run<T>(&self, request: impl Future<Output = Result<T>>) -> Result<T> {
+        self.runtime
+            .block_on(interruptible(request, crate::tools::check_interrupt))
+    }
+
+    async fn send(&self, request: RequestBuilder) -> Result<HttpResponse> {
         let response = request
             .header(AUTHORIZATION, self.auth.clone())
             .send()
+            .await
             .context("request to Adaption failed")?;
         let status = response.status();
         if status.is_success() {
             return Ok(response);
         }
 
-        let mut body = Vec::new();
-        response.take(8192).read_to_end(&mut body).ok();
+        let body = read_body(response, 8192).await.unwrap_or_default();
         let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
         let message = value
             .pointer("/error/message")
@@ -116,71 +146,106 @@ impl Client {
     }
 }
 
-fn stream(
-    mut input: impl BufRead,
-    on_text: &mut impl FnMut(&str) -> Result<()>,
-) -> Result<Response> {
-    let mut data = String::new();
-    let mut event = String::new();
-    let mut line = String::new();
+const MAX_EVENT: usize = 2 * 1024 * 1024;
+
+async fn interruptible<T>(
+    request: impl Future<Output = Result<T>>,
+    mut check_interrupt: impl FnMut() -> Result<()>,
+) -> Result<T> {
+    let mut request = std::pin::pin!(request);
     loop {
-        line.clear();
-        let count = (&mut input)
-            .take(MAX_EVENT + 1)
-            .read_line(&mut line)
-            .context("reading Adaption event stream")?;
-        ensure!(
-            count as u64 <= MAX_EVENT,
-            "Adaption event line is too large"
-        );
-        let field = line.trim_end_matches(['\r', '\n']);
-        if (count == 0 || field.is_empty()) && !data.is_empty() {
-            if data == "[DONE]" {
-                break;
-            }
-            let value: Value =
-                serde_json::from_str(&data).context("invalid Adaption stream event")?;
-            let kind = value.get("type").and_then(Value::as_str).unwrap_or(&event);
-            match kind {
-                "response.output_text.delta" | "response.refusal.delta" => {
-                    if let Some(delta) = value.get("delta").and_then(Value::as_str) {
-                        on_text(delta)?;
-                    }
-                }
-                "response.completed" => {
-                    return completed(
-                        value
-                            .get("response")
-                            .context("completed event is missing its response")?,
-                    );
-                }
-                "response.failed" | "response.incomplete" | "response.cancelled" | "error" => {
-                    bail!("Adaption {kind}: {}", failure(&value));
-                }
-                _ => {}
-            }
-            data.clear();
-            event.clear();
-        }
-        if count == 0 {
-            break;
-        }
-        if field.is_empty() {
-            event.clear();
-        } else if let Some(payload) = field.strip_prefix("data:") {
-            if !data.is_empty() {
-                data.push('\n');
-            }
-            data.push_str(payload.strip_prefix(' ').unwrap_or(payload));
-            ensure!(
-                data.len() as u64 <= MAX_EVENT,
-                "Adaption event is too large"
-            );
-        } else if let Some(name) = field.strip_prefix("event:") {
-            event = name.trim_start().to_owned();
+        check_interrupt()?;
+        if let Ok(result) = tokio::time::timeout(Duration::from_millis(100), &mut request).await {
+            check_interrupt()?;
+            return result;
         }
     }
-    bail!("Adaption stream ended before a completed response");
+}
+
+async fn read_body(mut response: HttpResponse, limit: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        ensure!(
+            body.len() + chunk.len() <= limit,
+            "Adaption response body is too large"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+#[derive(Default)]
+struct EventStream {
+    line: Vec<u8>,
+    data: String,
+    event: String,
+}
+
+impl EventStream {
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        on_text: &mut impl FnMut(&str) -> Result<()>,
+    ) -> Result<Option<Response>> {
+        for part in chunk.split_inclusive(|byte| *byte == b'\n') {
+            ensure!(
+                self.line.len() + part.len() <= MAX_EVENT,
+                "Adaption event line is too large"
+            );
+            self.line.extend_from_slice(part);
+            if part.last() != Some(&b'\n') {
+                continue;
+            }
+            let field = std::str::from_utf8(&self.line)?.trim_end_matches(['\r', '\n']);
+            if field.is_empty() {
+                if self.data == "[DONE]" {
+                    bail!("Adaption stream ended before a completed response");
+                }
+                if !self.data.is_empty() {
+                    let value: Value = serde_json::from_str(&self.data)
+                        .context("invalid Adaption stream event")?;
+                    let kind = value
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .unwrap_or(&self.event);
+                    match kind {
+                        "response.output_text.delta" | "response.refusal.delta" => {
+                            if let Some(delta) = value.get("delta").and_then(Value::as_str) {
+                                on_text(delta)?;
+                            }
+                        }
+                        "response.completed" => {
+                            return Ok(Some(completed(
+                                value
+                                    .get("response")
+                                    .context("completed event is missing its response")?,
+                            )?));
+                        }
+                        "response.failed"
+                        | "response.incomplete"
+                        | "response.cancelled"
+                        | "error" => {
+                            bail!("Adaption {kind}: {}", failure(&value));
+                        }
+                        _ => {}
+                    }
+                }
+                self.data.clear();
+                self.event.clear();
+            } else if let Some(payload) = field.strip_prefix("data:") {
+                if !self.data.is_empty() {
+                    self.data.push('\n');
+                }
+                self.data
+                    .push_str(payload.strip_prefix(' ').unwrap_or(payload));
+                ensure!(self.data.len() <= MAX_EVENT, "Adaption event is too large");
+            } else if let Some(name) = field.strip_prefix("event:") {
+                self.event = name.trim_start().to_owned();
+            }
+            self.line.clear();
+        }
+        Ok(None)
+    }
 }
 
 fn completed(value: &Value) -> Result<Response> {
@@ -214,7 +279,7 @@ fn failure(value: &Value) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::thread;
 
@@ -308,11 +373,47 @@ mod tests {
     #[test]
     fn stream_needs_a_completed_response() {
         let mut streamed = String::new();
-        let result = stream(
+        let result = EventStream::default().push(
             b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\ndata: [DONE]\n\n".as_slice(),
             &mut |text| { streamed.push_str(text); Ok(()) },
         );
         assert!(result.is_err());
         assert_eq!(streamed, "partial");
+    }
+
+    #[test]
+    fn a_stalled_response_can_be_interrupted() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut checks = 0;
+        let result = runtime.block_on(interruptible(std::future::pending::<Result<()>>(), || {
+            checks += 1;
+            if checks > 1 {
+                return Err(crate::terminal::Interrupted.into());
+            }
+            Ok(())
+        }));
+        assert!(result.unwrap_err().is::<crate::terminal::Interrupted>());
+    }
+
+    #[test]
+    fn streaming_text_handles_utf8_split_across_chunks() {
+        let event = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"café\"}\r\n\r\n";
+        let split = event.find('é').unwrap() + 1;
+        let mut stream = EventStream::default();
+        let mut text = String::new();
+        let mut on_text = |delta: &str| {
+            text.push_str(delta);
+            Ok(())
+        };
+        stream
+            .push(&event.as_bytes()[..split], &mut on_text)
+            .unwrap();
+        stream
+            .push(&event.as_bytes()[split..], &mut on_text)
+            .unwrap();
+        assert_eq!(text, "café");
     }
 }

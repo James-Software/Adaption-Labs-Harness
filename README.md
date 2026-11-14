@@ -20,6 +20,8 @@ adapt ask "Find where the CLI parses flags and explain how to add one."
 
 The CLI uses the Git root when it finds one and the current directory otherwise. Use `-C /path/to/project` to select a different workspace. The default model is `qwen3.5-397b`. The settings menu can list models available to your key. Pipe a multiline prompt with `adapt ask -`. For scripted use, `ADAPTION_API_KEY`, `ADAPTION_MODEL`, and `--model` override saved settings.
 
+Type `quit`, `exit`, or `/quit` at a prompt to leave. Ctrl+C exits while waiting for input and cancels an active coding task before returning to the prompt. Set `NO_COLOR=1` for plain terminal output.
+
 ## Use an adapting model
 
 In Adaption's app, create an active inference stack with your preferred coding model. The key must belong to the stack's organization, and the caller must own the stack. In `/settings`, set **Model or stack** to `stack:my-coder` using your stack's slug, and set **Agentic memory** to **On** or **Stack default**.
