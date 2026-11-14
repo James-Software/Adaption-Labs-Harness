@@ -298,7 +298,7 @@ mod tests {
         let client = Client::with_base(&format!("http://{addr}"), "test-key").unwrap();
         let workspace = crate::workspace::Workspace::open(Some(root.path().into())).unwrap();
         let mut agent =
-            crate::agent::Agent::new(client, "stack:coder".into(), Some(true), workspace);
+            crate::agent::Agent::new(client, "stack:coder".into(), Some(true), &workspace);
         let mut output = Vec::new();
         agent.run("List files.", &mut output).unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "I found hello.txt.\n");

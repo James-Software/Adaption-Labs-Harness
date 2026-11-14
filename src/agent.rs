@@ -1,6 +1,5 @@
 use std::collections::{HashSet, VecDeque};
 use std::io::Write;
-use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -19,11 +18,11 @@ file or approval restrictions. If the user denies an action, do not retry or wor
 Commands run directly with argv. Use them for project builds, tests and developer tools. \
 Never claim a change or a check succeeded without its tool result. Reply concisely.";
 
-pub struct Agent {
+pub struct Agent<'a> {
     client: Client,
     model: String,
     memory: Option<bool>,
-    workspace: Workspace,
+    workspace: &'a Workspace,
     approvals: Approvals,
     history: VecDeque<Turn>,
 }
@@ -33,8 +32,13 @@ struct Turn {
     bytes: usize,
 }
 
-impl Agent {
-    pub fn new(client: Client, model: String, memory: Option<bool>, workspace: Workspace) -> Self {
+impl<'a> Agent<'a> {
+    pub fn new(
+        client: Client,
+        model: String,
+        memory: Option<bool>,
+        workspace: &'a Workspace,
+    ) -> Self {
         Self {
             client,
             model,
@@ -47,9 +51,6 @@ impl Agent {
 
     pub fn model(&self) -> &str {
         &self.model
-    }
-    pub fn root(&self) -> &Path {
-        self.workspace.root()
     }
     pub fn clear_history(&mut self) {
         self.history.clear();
@@ -176,7 +177,7 @@ impl Agent {
             );
             for (id, name, args) in calls {
                 tools::check_interrupt()?;
-                let result = tools::run(name, args, &self.workspace, &mut self.approvals);
+                let result = tools::run(name, args, self.workspace, &mut self.approvals);
                 turn.push(json!({"type": "function_call_output", "call_id": id, "output": result.to_string()}));
             }
         }

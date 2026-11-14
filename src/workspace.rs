@@ -67,6 +67,12 @@ impl Workspace {
         }
         .canonicalize()
         .context("resolving the workspace")?;
+        ensure!(
+            !root.iter().any(|part| part
+                .to_str()
+                .is_some_and(|name| name.eq_ignore_ascii_case(".adaption-code"))),
+            "select a project outside the Adaption settings directory"
+        );
         let dir =
             Dir::open_ambient_dir(&root, ambient_authority()).context("opening the workspace")?;
         Ok(Self { root, dir })
@@ -487,6 +493,7 @@ fn allowed(name: &str) -> bool {
     !(terminal::line(&name) != name
         || name == ".git"
         || name == ".ssh"
+        || name == ".adaption-code"
         || name == ".aws"
         || name == ".netrc"
         || name == ".npmrc"

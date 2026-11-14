@@ -10,25 +10,21 @@ Install [stable Rust](https://rust-lang.org/tools/install/) and a C linker, then
 cargo install --locked --path .
 ```
 
-Create an [Adaption API key](https://docs.adaptionlabs.ai/inference-stacks/quickstart/) and set `ADAPTION_API_KEY` in your shell or secret manager. Run these commands from the project you want to work on:
+Create an [Adaption API key](https://docs.adaptionlabs.ai/inference-stacks/quickstart/), then launch `adaption-code` from the project you want to work on. The first-run popup opens `/settings`, where you can paste the key into a hidden prompt and save it. Run `/settings` again to change the key, model, or memory preference. The CLI writes `~/.adaption-code/settings.json` with owner-only permissions.
 
 ```sh
-adaption-code models
 adaption-code
+adaption-code models
 adaption-code ask "Find where the CLI parses flags and explain how to add one."
 ```
 
-The CLI uses the Git root when it finds one and the current directory otherwise. Use `-C /path/to/project` to select a different workspace. The default model is `qwen3.5-397b`. Set `ADAPTION_MODEL` or pass `--model` to use another ID from `adaption-code models`. Pipe a multiline prompt with `adaption-code ask -`. Interactive sessions support `/help`, `/clear`, `/permissions`, `/revoke`, and `/quit`.
+The CLI uses the Git root when it finds one and the current directory otherwise. Use `-C /path/to/project` to select a different workspace. The default model is `qwen3.5-397b`. The settings menu can list models available to your key. Pipe a multiline prompt with `adaption-code ask -`. For scripted use, `ADAPTION_API_KEY`, `ADAPTION_MODEL`, and `--model` override saved settings.
 
 ## Use an adapting model
 
-In Adaption's app, create an active inference stack with your preferred coding model. The key must belong to the stack's organization, and the caller must own the stack. Use its slug with:
+In Adaption's app, create an active inference stack with your preferred coding model. The key must belong to the stack's organization, and the caller must own the stack. In `/settings`, set **Model or stack** to `stack:my-coder` using your stack's slug, and set **Agentic memory** to **On** or **Stack default**.
 
-```sh
-adaption-code --model stack:my-coder --memory
-```
-
-Agentic memory lets Adaption build and recall information about your work, decisions, and preferences across conversations. It is scoped to the user and stack, and new memories are built in the background. You can manage them in the Adaption app. Omit `--memory` to use the stack's setting, or use `--no-memory` to disable memory for the session. This is adaptation through remembered context. Model training is managed separately in Adaption. See [Inference stack memory](https://docs.adaptionlabs.ai/inference-stacks/key-concepts/#memory).
+Agentic memory lets Adaption build and recall information about your work, decisions, and preferences across conversations. It is scoped to the user and stack, and new memories are built in the background. You can manage them in the Adaption app. The CLI flags `--memory` and `--no-memory` override the saved memory preference for one session. This is adaptation through remembered context. Model training is managed separately in Adaption. See [Inference stack memory](https://docs.adaptionlabs.ai/inference-stacks/key-concepts/#memory).
 
 Prompts, relevant source text, and tool results are sent to Adaption for inference. The CLI keeps conversation history in process memory, replays it with `store: false`, and drops older turns when the context limit is reached. Adaption's stack memory is a separate setting. Explicit local function definitions are sent on each tool-enabled request, which keeps the coding workflow on the CLI's own tools. See [Adaption's Responses guide](https://docs.adaptionlabs.ai/inference-stacks/generate-a-model-response/) and [API reference](https://docs.adaptionlabs.ai/api/resources/responses/methods/create).
 

@@ -1,12 +1,12 @@
 mod adaption;
 mod agent;
 mod approval;
+mod settings;
 mod terminal;
 mod tools;
 mod workspace;
 
-use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, StdinLock, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -15,17 +15,16 @@ use clap::{Parser, Subcommand};
 
 use adaption::Client;
 use agent::Agent;
+use settings::{Config, Connection, Settings};
 use terminal::{line, visible};
 use workspace::Workspace;
-
-const DEFAULT_MODEL: &str = "qwen3.5-397b";
 
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
     /// Adaption model ID or stack:<slug>.
-    #[arg(long, env = "ADAPTION_MODEL", default_value = DEFAULT_MODEL, global = true)]
-    model: String,
+    #[arg(long, env = "ADAPTION_MODEL", global = true)]
+    model: Option<String>,
     /// Project directory. Defaults to the Git root, or the current directory.
     #[arg(short = 'C', long, global = true)]
     dir: Option<PathBuf>,
@@ -63,19 +62,17 @@ fn main() -> ExitCode {
 
 fn run(cli: Cli) -> Result<()> {
     let memory = if cli.memory {
-        if !cli.model.starts_with("stack:") || cli.model == "stack:" {
-            bail!("--memory requires --model stack:<slug>");
-        }
         Some(true)
     } else {
         cli.no_memory.then_some(false)
     };
-
-    let key = env::var("ADAPTION_API_KEY").context("set ADAPTION_API_KEY in your environment")?;
-    let client = Client::new(&key)?;
+    let config = Config::locate()?;
+    let mut settings = config.load()?;
+    let model = cli.model.as_deref();
 
     if matches!(cli.command, Some(Mode::Models)) {
-        for model in client.models()? {
+        let key = settings.key().context(SETUP_REQUIRED)?;
+        for model in Client::new(&key)?.models()? {
             println!("{}", line(&model));
         }
         return Ok(());
@@ -105,19 +102,38 @@ fn run(cli: Cli) -> Result<()> {
 
     let workspace = Workspace::open(cli.dir)?;
     tools::install_interrupt_handler()?;
-    let mut agent = Agent::new(client, cli.model, memory, workspace);
     if let Some(prompt) = prompt {
-        return agent.run(&prompt, &mut io::stdout().lock());
+        let connection = settings
+            .connection(model, memory)?
+            .context(SETUP_REQUIRED)?;
+        return connect(&connection, &workspace)?.run(&prompt, &mut io::stdout().lock());
     }
 
-    eprintln!("Adaption Code · {}", line(agent.model()));
-    eprintln!("Workspace: {}", line(&agent.root().display().to_string()));
-    eprintln!("Commands: /help, /clear, /permissions, /revoke, /quit");
-    let stdin = io::stdin();
+    let mut input = io::stdin().lock();
+    let mut output = io::stderr().lock();
+    eprintln!("Adaption Code");
+    eprintln!(
+        "Workspace: {}",
+        line(&workspace.root().display().to_string())
+    );
+    eprintln!("Commands: /settings, /help, /clear, /permissions, /revoke, /quit");
+    if settings.key().is_none() && settings::setup_popup(&mut input, &mut output)? {
+        edit_settings(
+            &mut settings,
+            &config,
+            &mut input,
+            &mut output,
+            model,
+            memory,
+        );
+    }
+    drop(output);
+
+    let mut session: Option<(Connection, Agent<'_>)> = None;
     loop {
         eprint!("\nadaption> ");
         io::stderr().flush()?;
-        let Some(prompt) = terminal::read_line(&mut stdin.lock())? else {
+        let Some(prompt) = terminal::read_line(&mut input)? else {
             break;
         };
         match prompt.trim() {
@@ -125,26 +141,92 @@ fn run(cli: Cli) -> Result<()> {
             "/quit" | "/exit" => break,
             "/help" => eprintln!(
                 "Enter a coding task or ask a follow-up.\n\
+                 /settings configures Adaption\n\
                  /clear clears the conversation\n\
                  /permissions shows remembered approvals\n\
                  /revoke clears remembered approvals\n\
                  /quit exits"
             ),
+            "/settings" => {
+                edit_settings(
+                    &mut settings,
+                    &config,
+                    &mut input,
+                    &mut io::stderr().lock(),
+                    model,
+                    memory,
+                );
+                if let Some((previous, _)) = &session
+                    && settings.connection(model, memory).ok().flatten().as_ref() != Some(previous)
+                {
+                    session = None;
+                    eprintln!("A new conversation will use the updated connection.");
+                }
+            }
             "/clear" => {
-                agent.clear_history();
+                if let Some((_, agent)) = &mut session {
+                    agent.clear_history();
+                }
                 eprintln!("Conversation cleared.");
             }
-            "/permissions" => agent.show_permissions(),
+            "/permissions" => {
+                if let Some((_, agent)) = &session {
+                    agent.show_permissions();
+                } else {
+                    eprintln!("No remembered approvals.");
+                }
+            }
             "/revoke" => {
-                agent.revoke_permissions();
+                if let Some((_, agent)) = &mut session {
+                    agent.revoke_permissions();
+                }
                 eprintln!("Remembered approvals cleared.");
             }
             _ => {
-                if let Err(error) = agent.run(&prompt, &mut io::stdout().lock()) {
+                let result = (|| -> Result<()> {
+                    let connection = settings
+                        .connection(model, memory)?
+                        .context(SETUP_REQUIRED)?;
+                    if session.is_none() {
+                        let agent = connect(&connection, &workspace)?;
+                        eprintln!("Model: {}", line(agent.model()));
+                        session = Some((connection, agent));
+                    }
+                    if let Some((_, agent)) = &mut session {
+                        agent.run(&prompt, &mut io::stdout().lock())?;
+                    }
+                    Ok(())
+                })();
+                if let Err(error) = result {
                     eprintln!("Error: {}", visible(&format!("{error:#}")));
                 }
             }
         }
     }
     Ok(())
+}
+
+const SETUP_REQUIRED: &str =
+    "Adaption is unconfigured. Run adaption-code and open /settings to add an API key.";
+
+fn connect<'a>(connection: &Connection, workspace: &'a Workspace) -> Result<Agent<'a>> {
+    Ok(Agent::new(
+        Client::new(&connection.key)?,
+        connection.model.clone(),
+        connection.memory,
+        workspace,
+    ))
+}
+
+fn edit_settings(
+    settings: &mut Settings,
+    config: &Config,
+    input: &mut StdinLock<'_>,
+    output: &mut impl Write,
+    model: Option<&str>,
+    memory: Option<bool>,
+) {
+    if let Err(error) = settings::edit(settings, config, input, output, model, memory) {
+        eprintln!("Error: {}", visible(&format!("{error:#}")));
+    }
 }
