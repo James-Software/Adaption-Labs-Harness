@@ -19,13 +19,18 @@ use settings::{Config, Connection, Settings};
 use terminal::{line, visible};
 use workspace::Workspace;
 
-const BANNER: &str = r#"
-  #   ####    #   ####  ##### #####  ###  #   #   #       #   ####   ####
- # #  #   #  # #  #   #   #     #   #   # ##  #   #      # #  #   # #
-##### #   # ##### ####    #     #   #   # # # #   #     ##### ####   ###
-#   # #   # #   # #       #     #   #   # #  ##   #     #   # #   #     #
-#   # ####  #   # #       #   #####  ###  #   #   ##### #   # ####  ####
-"#;
+const LOGO: [&str; 3] = [
+    r#"                ..+####.
++#+   +#+  #############
+                ''+####'"#,
+    r#"          .+##+.   .+++.
++##############   +#####
++##############   ######
+          '+##+'   '+++'"#,
+    r#".+##+.   .+##+.   .+##+.
+######   ######   ######
+'+##+'   '+##+'   '+##+'"#,
+];
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -124,12 +129,11 @@ fn run(cli: Cli) -> Result<()> {
         .map(|size| usize::from(size.ws_col))
         .filter(|&width| width > 0)
         .unwrap_or(80);
-    if BANNER.lines().all(|row| row.len() <= width) {
-        write!(output, "{BANNER}")?;
-    } else {
-        writeln!(output, "\nAdaption Labs")?;
-    }
-    writeln!(output, "Adapt")?;
+    write_banner(
+        &mut output,
+        width,
+        banner_colors(io::stderr().is_terminal()),
+    )?;
     writeln!(
         output,
         "Workspace: {}",
@@ -230,6 +234,58 @@ fn run(cli: Cli) -> Result<()> {
 
 const SETUP_REQUIRED: &str =
     "Adaption is unconfigured. Run adapt and open /settings to add an API key.";
+
+fn write_banner(
+    output: &mut impl Write,
+    width: usize,
+    colors: Option<[&str; 3]>,
+) -> io::Result<()> {
+    writeln!(output)?;
+    if LOGO
+        .iter()
+        .flat_map(|row| row.lines())
+        .all(|line| line.len() <= width)
+    {
+        for (index, row) in LOGO.iter().enumerate() {
+            if index > 0 {
+                writeln!(output)?;
+            }
+            if let Some(colors) = colors {
+                writeln!(output, "{}{row}\x1b[39m", colors[index])?;
+            } else {
+                writeln!(output, "{row}")?;
+            }
+        }
+        writeln!(output)?;
+    }
+    writeln!(output, "Adapt")
+}
+
+fn banner_colors(is_terminal: bool) -> Option<[&'static str; 3]> {
+    let term = std::env::var("TERM").unwrap_or_default();
+    if !is_terminal
+        || term == "dumb"
+        || std::env::var_os("NO_COLOR").is_some_and(|value| !value.is_empty())
+    {
+        return None;
+    }
+
+    // The blue, lavender, and rose accents are from Adaption's homepage stylesheet.
+    let color_term = std::env::var("COLORTERM").unwrap_or_default();
+    Some(
+        if color_term == "truecolor" || color_term == "24bit" || term.ends_with("-direct") {
+            [
+                "\x1b[38;2;73;134;180m",
+                "\x1b[38;2;169;186;209m",
+                "\x1b[38;2;218;167;210m",
+            ]
+        } else if term.contains("256color") {
+            ["\x1b[38;5;67m", "\x1b[38;5;146m", "\x1b[38;5;182m"]
+        } else {
+            ["\x1b[34m", "\x1b[36m", "\x1b[35m"]
+        },
+    )
+}
 
 fn connect<'a>(connection: &Connection, workspace: &'a Workspace) -> Result<Agent<'a>> {
     Ok(Agent::new(
