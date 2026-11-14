@@ -176,7 +176,7 @@ fn valid_key(key: &str) -> bool {
 }
 
 pub fn setup_popup(input: &mut impl BufRead, output: &mut impl Write) -> Result<bool> {
-    writeln!(output, "\n╭─ Adaption setup ─────────────────────────╮")?;
+    writeln!(output, "\n╭─ Adapt setup ────────────────────────────╮")?;
     writeln!(output, "│ Add your Adaption API key in /settings.  │")?;
     writeln!(output, "│ 1. Open /settings     2. Later            │")?;
     writeln!(output, "╰──────────────────────────────────────────╯")?;

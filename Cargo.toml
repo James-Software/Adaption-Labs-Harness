@@ -1,9 +1,9 @@
 [package]
-name = "adaption-code"
+name = "adapt"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
-description = "A terminal coding agent powered by Adaption"
+description = "Adapt, a terminal coding agent powered by Adaption Labs"
 
 [dependencies]
 anyhow = "1"

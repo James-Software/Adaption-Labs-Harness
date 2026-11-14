@@ -1,6 +1,6 @@
-# Adaption Code
+# Adapt
 
-Adaption Code is a Rust terminal coding agent for macOS and Linux. It uses Adaption's Responses API to explore a project, propose edits, run developer commands, and stream replies.
+Adapt is a Rust terminal coding agent for macOS and Linux. It uses Adaption's Responses API to explore a project, propose edits, run developer commands, and stream replies.
 
 ## Install and run
 
@@ -10,15 +10,15 @@ Install [stable Rust](https://rust-lang.org/tools/install/) and a C linker, then
 cargo install --locked --path .
 ```
 
-Create an [Adaption API key](https://docs.adaptionlabs.ai/inference-stacks/quickstart/), then launch `adaption-code` from the project you want to work on. The first-run popup opens `/settings`, where you can paste the key into a hidden prompt and save it. Run `/settings` again to change the key, model, or memory preference. The CLI writes `~/.adaption-code/settings.json` with owner-only permissions.
+Create an [Adaption API key](https://docs.adaptionlabs.ai/inference-stacks/quickstart/), then launch `adapt` from the project you want to work on. The first-run popup opens `/settings`, where you can paste the key into a hidden prompt and save it. Run `/settings` again to change the key, model, or memory preference. The CLI writes `~/.adaption-code/settings.json` with owner-only permissions.
 
 ```sh
-adaption-code
-adaption-code models
-adaption-code ask "Find where the CLI parses flags and explain how to add one."
+adapt
+adapt models
+adapt ask "Find where the CLI parses flags and explain how to add one."
 ```
 
-The CLI uses the Git root when it finds one and the current directory otherwise. Use `-C /path/to/project` to select a different workspace. The default model is `qwen3.5-397b`. The settings menu can list models available to your key. Pipe a multiline prompt with `adaption-code ask -`. For scripted use, `ADAPTION_API_KEY`, `ADAPTION_MODEL`, and `--model` override saved settings.
+The CLI uses the Git root when it finds one and the current directory otherwise. Use `-C /path/to/project` to select a different workspace. The default model is `qwen3.5-397b`. The settings menu can list models available to your key. Pipe a multiline prompt with `adapt ask -`. For scripted use, `ADAPTION_API_KEY`, `ADAPTION_MODEL`, and `--model` override saved settings.
 
 ## Use an adapting model
 
@@ -46,4 +46,4 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ```
 
-The tests exercise the Adaption request and streaming tool loop with a local mock, approval matching, literal command arguments, path boundaries, and stale edits. To check against your account, use `adaption-code models`, then ask the agent to list a project's files and summarize one.
+The tests exercise the Adaption request and streaming tool loop with a local mock, approval matching, literal command arguments, path boundaries, and stale edits. To check against your account, use `adapt models`, then ask the agent to list a project's files and summarize one.

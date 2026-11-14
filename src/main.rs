@@ -19,6 +19,14 @@ use settings::{Config, Connection, Settings};
 use terminal::{line, visible};
 use workspace::Workspace;
 
+const BANNER: &str = r#"
+  #   ####    #   ####  ##### #####  ###  #   #   #       #   ####   ####
+ # #  #   #  # #  #   #   #     #   #   # ##  #   #      # #  #   # #
+##### #   # ##### ####    #     #   #   # # # #   #     ##### ####   ###
+#   # #   # #   # #       #     #   #   # #  ##   #     #   # #   #     #
+#   # ####  #   # #       #   #####  ###  #   #   ##### #   # ####  ####
+"#;
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -81,7 +89,7 @@ fn run(cli: Cli) -> Result<()> {
     let prompt = match cli.command {
         Some(Mode::Ask { prompt }) if prompt == ["-"] => {
             if io::stdin().is_terminal() {
-                bail!("pipe a prompt to adaption-code ask -");
+                bail!("pipe a prompt to adapt ask -");
             }
             let mut input = io::stdin().lock();
             let mut prompt = String::new();
@@ -97,7 +105,7 @@ fn run(cli: Cli) -> Result<()> {
         Some(Mode::Models) => unreachable!(),
     };
     if prompt.is_none() && !io::stdin().is_terminal() {
-        bail!("use adaption-code ask \"your prompt\" or pipe a prompt to adaption-code ask -");
+        bail!("use adapt ask \"your prompt\" or pipe a prompt to adapt ask -");
     }
 
     let workspace = Workspace::open(cli.dir)?;
@@ -111,12 +119,26 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut input = io::stdin().lock();
     let mut output = io::stderr().lock();
-    eprintln!("Adaption Code");
-    eprintln!(
+    let width = rustix::termios::tcgetwinsize(&input)
+        .ok()
+        .map(|size| usize::from(size.ws_col))
+        .filter(|&width| width > 0)
+        .unwrap_or(80);
+    if BANNER.lines().all(|row| row.len() <= width) {
+        write!(output, "{BANNER}")?;
+    } else {
+        writeln!(output, "\nAdaption Labs")?;
+    }
+    writeln!(output, "Adapt")?;
+    writeln!(
+        output,
         "Workspace: {}",
         line(&workspace.root().display().to_string())
-    );
-    eprintln!("Commands: /settings, /help, /clear, /permissions, /revoke, /quit");
+    )?;
+    writeln!(
+        output,
+        "Commands: /settings, /help, /clear, /permissions, /revoke, /quit"
+    )?;
     if settings.key().is_none() && settings::setup_popup(&mut input, &mut output)? {
         edit_settings(
             &mut settings,
@@ -131,7 +153,7 @@ fn run(cli: Cli) -> Result<()> {
 
     let mut session: Option<(Connection, Agent<'_>)> = None;
     loop {
-        eprint!("\nadaption> ");
+        eprint!("\nadapt> ");
         io::stderr().flush()?;
         let Some(prompt) = terminal::read_line(&mut input)? else {
             break;
@@ -207,7 +229,7 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 const SETUP_REQUIRED: &str =
-    "Adaption is unconfigured. Run adaption-code and open /settings to add an API key.";
+    "Adaption is unconfigured. Run adapt and open /settings to add an API key.";
 
 fn connect<'a>(connection: &Connection, workspace: &'a Workspace) -> Result<Agent<'a>> {
     Ok(Agent::new(
