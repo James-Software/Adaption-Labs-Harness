@@ -2,10 +2,8 @@ use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::PathBuf;
 
-use anyhow::Result;
-use rustix::termios::{QueueSelector, tcflush};
-
 use crate::terminal::{self, Palette, Tone};
+use anyhow::Result;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -38,6 +36,16 @@ enum Decision {
     Once,
     Denied,
 }
+
+const OPTIONS: [(&str, Decision); 3] = [
+    (
+        "Always Allow (this exact action, for this session)",
+        Decision::Always,
+    ),
+    ("Allow This Time", Decision::Once),
+    ("Deny", Decision::Denied),
+];
+const DEFAULT_CHOICE: usize = 2;
 
 impl Action {
     fn label(&self) -> String {
@@ -89,17 +97,18 @@ impl Approvals {
             );
             return Ok(false);
         };
-        tcflush(&tty, QueueSelector::IFlush)?;
         let mut input = terminal::TerminalInput::new(tty.try_clone()?);
-        let decision = prompt(
+        let palette = Palette::detect(true);
+        write_preview(&mut tty, &action.label(), preview, palette)?;
+        let selected = terminal::select(
+            &mut input,
             &mut tty,
-            &action.label(),
-            preview,
-            Palette::detect(true),
-            || terminal::read_interactive_line(&mut input),
+            &OPTIONS.map(|(label, _)| label),
+            DEFAULT_CHOICE,
+            palette,
         )?;
         crate::tools::check_interrupt()?;
-        Ok(self.record(action, decision))
+        Ok(self.record(action, decision_for(selected)))
     }
 
     fn record(&mut self, action: Action, decision: Decision) -> bool {
@@ -123,13 +132,16 @@ impl Approvals {
     }
 }
 
-fn prompt(
+fn decision_for(selected: Option<usize>) -> Decision {
+    OPTIONS[selected.unwrap_or(DEFAULT_CHOICE)].1
+}
+
+fn write_preview(
     output: &mut impl Write,
     label: &str,
     preview: &str,
     palette: Palette,
-    mut read_choice: impl FnMut() -> Result<Option<String>>,
-) -> Result<Decision> {
+) -> Result<()> {
     let border = palette.paint(Tone::Info, "│");
     writeln!(
         output,
@@ -153,39 +165,7 @@ fn prompt(
         };
         writeln!(output, "{border} {text}")?;
     }
-    writeln!(
-        output,
-        "{border} {}",
-        palette.paint(
-            Tone::Text,
-            "1. Always Allow (this exact action, for this session)"
-        )
-    )?;
-    writeln!(
-        output,
-        "{border} {}",
-        palette.paint(Tone::Text, "2. Allow This Time")
-    )?;
-    writeln!(
-        output,
-        "{border} {}",
-        palette.paint(Tone::Action, "3. Deny")
-    )?;
-    writeln!(output, "{}", palette.paint(Tone::Info, "╰─"))?;
-    loop {
-        write!(output, "{}", palette.paint(Tone::Action, "Choice [3]: "))?;
-        output.flush()?;
-        match read_choice()?.as_deref().map(str::trim) {
-            Some("1") => return Ok(Decision::Always),
-            Some("2") => return Ok(Decision::Once),
-            Some("3" | "") | None => return Ok(Decision::Denied),
-            _ => writeln!(
-                output,
-                "{}",
-                palette.paint(Tone::Action, "Enter 1, 2, or 3.")
-            )?,
-        }
-    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -235,20 +215,13 @@ mod tests {
 
     #[test]
     fn only_explicit_always_is_remembered() {
-        for (input, decision) in [
-            ("1\n", Decision::Always),
-            ("2\n", Decision::Once),
-            ("3\n", Decision::Denied),
-            ("\n", Decision::Denied),
-            ("", Decision::Denied),
-            ("yes\n", Decision::Denied),
+        for (selection, decision) in [
+            (Some(0), Decision::Always),
+            (Some(1), Decision::Once),
+            (Some(DEFAULT_CHOICE), Decision::Denied),
+            (None, Decision::Denied),
         ] {
-            let mut output = Vec::new();
-            let mut input = input.as_bytes();
-            let result = prompt(&mut output, "label", "preview", Palette::default(), || {
-                Ok(terminal::read_line(&mut input)?)
-            })
-            .unwrap();
+            let result = decision_for(selection);
             assert_eq!(result, decision);
             let mut approvals = Approvals::default();
             let action = command(&["status"]);

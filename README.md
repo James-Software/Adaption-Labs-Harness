@@ -24,15 +24,17 @@ adapt --no-memory -C /path/to/your/project
 ```
 
 1. In the first-run menu, press **Enter** to open `/settings`.
-2. Choose **1. API key**, paste the key into the hidden prompt, and press **Enter**.
-3. Choose **5. Save and return**.
+2. Select **API key**, paste the key into the hidden prompt, and press **Enter**.
+3. Use **↓** to highlight **Save and return**, then press **Enter**.
 4. At `adapt>`, try `List the project files and summarize the README.` Type `/quit` to leave.
 
-Run `adapt models` to check that your key can list the available models. The default model is `qwen3.5-397b`. Open `/settings` again to change your key or model. Saved keys are plaintext in `~/.adaption-code/settings.json` with owner-only permissions. For session-only configuration, set `ADAPTION_API_KEY` in your environment.
+Use **↑** and **↓** to move through any menu, **Enter** to choose, and **Esc** to go back. In `/settings`, select **Model or stack** to choose from the models available to your key or enter a custom model ID or `stack:<slug>`. The default model is `qwen3.5-397b`. Use `adapt models` to print the list in a script or terminal.
+
+Saved keys are plaintext in `~/.adaption-code/settings.json` with owner-only permissions. For session-only configuration, set `ADAPTION_API_KEY` in your environment.
 
 When you launch without `-C`, Adapt uses the Git root if it finds one, or the current directory otherwise. For one-off prompts, run `adapt -C /path/to/your/project ask "Summarize the README."` or pipe a multiline prompt to `adapt ask -`. The `ADAPTION_MODEL` environment variable and `--model` flag override the saved model.
 
-Type `quit`, `exit`, or `/quit` at a prompt to leave. Ctrl+C exits while waiting for input and cancels an active coding task before returning to the prompt. Set `NO_COLOR=1` for plain terminal output.
+Type `quit`, `exit`, or `/quit` at a prompt to leave. Ctrl+C exits while waiting for input and cancels an active coding task before returning to the prompt. Set `NO_COLOR=1` to disable terminal colors.
 
 ## Hackathon use
 
@@ -52,9 +54,9 @@ Prompts, source text returned by file tools, and tool results, including capture
 
 The agent can list, search, and read project files without prompting. Search and listing honor ignore rules. Built-in file operations reject parent traversal, symlinks, and common credential paths. Writes show a diff and recheck the target after review.
 
-- **1. Always Allow** remembers the exact action until you exit or use `/revoke`. A command must match the resolved executable and its fingerprint, argument list, and working directory. An edit must match the path and reviewed change.
-- **2. Allow This Time** grants a single invocation.
-- **3. Deny** skips the action. Enter alone, EOF, and the absence of a controlling terminal also deny.
+- **Always Allow** remembers the exact action until you exit or use `/revoke`. A command must match the resolved executable and its fingerprint, argument list, and working directory. An edit must match the path and reviewed change.
+- **Allow This Time** grants a single invocation.
+- **Deny** starts highlighted. Press **Enter** to confirm it or **Esc** to deny immediately. EOF and the absence of a controlling terminal also deny.
 
 Commands receive literal arguments and start in the displayed directory with your user account's permissions. They inherit your environment except for `ADAPTION_API_KEY`. A command can invoke project scripts and dependencies and may behave differently after those change. Use **Allow This Time** when you want to review each run. Approvals limit which action the harness starts. An approved process can still have side effects outside the project, and concurrent programs can still change files.
 

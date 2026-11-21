@@ -1,10 +1,14 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use anyhow::Result;
-use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
+use rustix::event::{
+    FdSetElement, Timespec, fd_set_insert, fd_set_num_elements, select as select_io,
+};
+use rustix::termios::{
+    LocalModes, OptionalActions, SpecialCodeIndex, Termios, tcgetattr, tcgetwinsize, tcsetattr,
+};
 
 #[derive(Clone, Copy)]
 pub enum Tone {
@@ -128,19 +132,243 @@ impl BufRead for TerminalInput {
 }
 
 fn wait_for_input(fd: BorrowedFd<'_>) -> Result<()> {
-    let mut events = [PollFd::from_borrowed_fd(fd, PollFlags::IN)];
+    while !input_ready(fd)? {}
+    Ok(())
+}
+
+fn input_ready(fd: BorrowedFd<'_>) -> Result<bool> {
+    let raw = fd.as_raw_fd();
+    let mut readable = vec![FdSetElement::default(); fd_set_num_elements(1, raw + 1)];
     let interval = Timespec {
         tv_sec: 0,
         tv_nsec: 100_000_000,
     };
     loop {
         crate::tools::check_interrupt()?;
-        match poll(&mut events, Some(&interval)) {
-            Ok(0) | Err(rustix::io::Errno::INTR) => continue,
-            Ok(_) => return crate::tools::check_interrupt(),
+        readable.fill(FdSetElement::default());
+        fd_set_insert(&mut readable, raw);
+        // macOS poll reports POLLNVAL for /dev/tty.
+        // SAFETY: The set contains only the borrowed, open descriptor.
+        match unsafe { select_io(raw + 1, Some(&mut readable), None, None, Some(&interval)) } {
+            Err(rustix::io::Errno::INTR) => continue,
+            Ok(count) => {
+                crate::tools::check_interrupt()?;
+                return Ok(count != 0);
+            }
             Err(error) => return Err(error.into()),
         }
     }
+}
+
+struct RestoreTerminal<'a> {
+    fd: BorrowedFd<'a>,
+    original: Termios,
+}
+
+impl Drop for RestoreTerminal<'_> {
+    fn drop(&mut self) {
+        let _ = tcsetattr(self.fd, OptionalActions::Flush, &self.original);
+    }
+}
+
+pub fn select(
+    input: &mut TerminalInput,
+    output: &mut impl Write,
+    options: &[impl AsRef<str>],
+    initial: usize,
+    palette: Palette,
+) -> Result<Option<usize>> {
+    let fd = rustix::io::dup(input.as_fd())?;
+    let original = tcgetattr(&fd)?;
+    let mut mode = original.clone();
+    mode.local_modes
+        .remove(LocalModes::ICANON | LocalModes::ECHO | LocalModes::ECHONL);
+    mode.special_codes[SpecialCodeIndex::VMIN] = 1;
+    mode.special_codes[SpecialCodeIndex::VTIME] = 0;
+    tcsetattr(&fd, OptionalActions::Flush, &mode)?;
+    let restore = RestoreTerminal {
+        fd: fd.as_fd(),
+        original,
+    };
+    let ansi = std::env::var("TERM").is_ok_and(|term| !term.is_empty() && term != "dumb");
+    if ansi {
+        write!(output, "\x1b[?2004h")?;
+    }
+    let selected = select_option(input, output, options, initial, palette, ansi);
+    drop(restore);
+    if ansi {
+        write!(output, "\x1b[?2004l")?;
+        output.flush()?;
+    }
+    selected
+}
+
+fn select_option(
+    input: &mut TerminalInput,
+    output: &mut impl Write,
+    options: &[impl AsRef<str>],
+    mut selected: usize,
+    palette: Palette,
+    ansi: bool,
+) -> Result<Option<usize>> {
+    let size = tcgetwinsize(&*input).ok();
+    let rows = size.map_or(0, |size| size.ws_row);
+    let count = if rows == 0 {
+        9
+    } else {
+        usize::from(rows.saturating_sub(3)).clamp(1, 9)
+    }
+    .min(options.len());
+    let mut top = 0;
+    let mut typed = Vec::with_capacity(6);
+    let mut redraw = false;
+    loop {
+        top = top.min(selected).max((selected + 1).saturating_sub(count));
+        if redraw && ansi {
+            write!(output, "\x1b[{}F\x1b[J", count + 1)?;
+        }
+        let width = tcgetwinsize(&*input)
+            .ok()
+            .map(|size| usize::from(size.ws_col))
+            .filter(|&width| width != 0)
+            .unwrap_or(80);
+        let border = palette.paint(Tone::Info, "│");
+        for (offset, option) in options[top..top + count].iter().enumerate() {
+            let label = line(option.as_ref());
+            let marker = if top + offset == selected {
+                "› "
+            } else {
+                "  "
+            };
+            let tone = if top + offset == selected {
+                Tone::Action
+            } else {
+                Tone::Text
+            };
+            writeln!(
+                output,
+                "{border} {}",
+                palette.paint(
+                    tone,
+                    format!("{marker}{}", fit(&label, width.saturating_sub(5)))
+                )
+            )?;
+        }
+        let footer = if count == options.len() {
+            "↑/↓ move   Enter select   Esc back".to_owned()
+        } else {
+            format!(
+                "↑/↓ move   Enter select   Esc back   {}/{}",
+                selected + 1,
+                options.len()
+            )
+        };
+        writeln!(
+            output,
+            "{}",
+            palette.paint(
+                Tone::Info,
+                format!("╰─ {}", fit(&footer, width.saturating_sub(4)))
+            )
+        )?;
+        output.flush()?;
+        redraw = true;
+        loop {
+            wait_for_input(input.as_fd())?;
+            match menu_key(input)? {
+                MenuKey::Up | MenuKey::Down if !typed.is_empty() => {}
+                MenuKey::Up => {
+                    selected = selected.saturating_sub(1);
+                    break;
+                }
+                MenuKey::Down => {
+                    selected = (selected + 1).min(options.len() - 1);
+                    break;
+                }
+                MenuKey::Select if typed.is_empty() => return Ok(Some(selected)),
+                MenuKey::Select => {
+                    if matches!(typed.as_slice(), b"quit" | b"exit" | b"/quit" | b"/exit") {
+                        return Err(ExitRequested.into());
+                    }
+                    typed.clear();
+                }
+                MenuKey::Cancel => return Ok(None),
+                MenuKey::Text(byte) if typed.len() < 6 => typed.push(byte),
+                MenuKey::Text(_) | MenuKey::Ignore => {}
+            }
+        }
+    }
+}
+
+fn fit(text: &str, width: usize) -> &str {
+    let mut columns = 0;
+    for (index, ch) in text.char_indices() {
+        // Budget up to two terminal cells for non-ASCII characters.
+        columns += if ch.is_ascii() { 1 } else { 2 };
+        if columns > width {
+            return &text[..index];
+        }
+    }
+    text
+}
+
+enum MenuKey {
+    Up,
+    Down,
+    Select,
+    Cancel,
+    Text(u8),
+    Ignore,
+}
+
+fn menu_key(input: &mut TerminalInput) -> Result<MenuKey> {
+    let mut byte = [0];
+    if input.read(&mut byte)? == 0 {
+        return Ok(MenuKey::Cancel);
+    }
+    match byte[0] {
+        b'\r' | b'\n' => return Ok(MenuKey::Select),
+        4 => return Ok(MenuKey::Cancel),
+        0x1b => {}
+        other => return Ok(MenuKey::Text(other)),
+    }
+    if !input_ready(input.as_fd())? || input.read(&mut byte)? == 0 {
+        return Ok(MenuKey::Cancel);
+    }
+    if !matches!(byte[0], b'[' | b'O') {
+        return Ok(MenuKey::Ignore);
+    }
+    let mut sequence = Vec::with_capacity(4);
+    while input_ready(input.as_fd())? && input.read(&mut byte)? != 0 {
+        if sequence.len() < 5 {
+            sequence.push(byte[0]);
+        }
+        if (0x40..=0x7e).contains(&byte[0]) {
+            return Ok(match sequence.as_slice() {
+                b"A" => MenuKey::Up,
+                b"B" => MenuKey::Down,
+                b"200~" => {
+                    // Bracketed paste is data even if it contains arrow keys or Enter.
+                    let end = b"\x1b[201~";
+                    let mut matched = 0;
+                    while matched < end.len() {
+                        wait_for_input(input.as_fd())?;
+                        if input.read(&mut byte)? == 0 {
+                            return Ok(MenuKey::Cancel);
+                        }
+                        matched = if byte[0] == end[matched] {
+                            matched + 1
+                        } else {
+                            usize::from(byte[0] == end[0])
+                        };
+                    }
+                    MenuKey::Ignore
+                }
+                _ => MenuKey::Ignore,
+            });
+        }
+    }
+    Ok(MenuKey::Ignore)
 }
 
 pub fn read_line(input: &mut impl BufRead) -> io::Result<Option<String>> {
@@ -170,17 +398,6 @@ pub fn read_hidden_line(
     output: &mut impl Write,
     prompt: &str,
 ) -> Result<Option<String>> {
-    struct RestoreEcho<'a> {
-        fd: BorrowedFd<'a>,
-        original: Termios,
-    }
-
-    impl Drop for RestoreEcho<'_> {
-        fn drop(&mut self) {
-            let _ = tcsetattr(self.fd, OptionalActions::Flush, &self.original);
-        }
-    }
-
     let fd = rustix::io::dup(input.as_fd())?;
     let original = tcgetattr(&fd)?;
     let mut hidden = original.clone();
@@ -188,7 +405,7 @@ pub fn read_hidden_line(
         .local_modes
         .remove(LocalModes::ECHO | LocalModes::ECHONL);
     tcsetattr(&fd, OptionalActions::Flush, &hidden)?;
-    let restore = RestoreEcho {
+    let restore = RestoreTerminal {
         fd: fd.as_fd(),
         original,
     };
@@ -231,6 +448,58 @@ fn escape(text: &str, multiline: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waits_for_input_on_the_controlling_terminal() {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+
+        use rustix::fs::{Mode, OFlags, open};
+        use rustix::process::{ioctl_tiocsctty, setsid};
+        use rustix::pty::{OpenptFlags, grantpt, openpt, ptsname, unlockpt};
+
+        const FIXTURE: &str = "ADAPT_TEST_CONTROLLING_TERMINAL";
+        if std::env::var_os(FIXTURE).is_some() {
+            let tty = File::open("/dev/tty").unwrap();
+            assert!(
+                !input_ready(tty.as_fd()).unwrap(),
+                "empty terminal was reported ready"
+            );
+            return;
+        }
+
+        let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        grantpt(&master).unwrap();
+        unlockpt(&master).unwrap();
+        let name = ptsname(&master, Vec::new()).unwrap();
+        let slave = open(
+            name.as_c_str(),
+            OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let mut test = Command::new(std::env::current_exe().unwrap());
+        test.args([
+            "--exact",
+            "terminal::tests::waits_for_input_on_the_controlling_terminal",
+            "--nocapture",
+        ])
+        .env(FIXTURE, "1")
+        .stdin(Stdio::null());
+        // The child creates a new session and takes ownership of the fixture terminal.
+        unsafe {
+            test.pre_exec(move || {
+                setsid()?;
+                Ok(ioctl_tiocsctty(&slave)?)
+            });
+        }
+        let result = test.output().unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 
     #[test]
     fn escapes_controls_and_bidi_marks_in_untrusted_text() {

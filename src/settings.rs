@@ -1,7 +1,6 @@
 use std::env;
 use std::fs::{self, DirBuilder, File};
-use std::io::{self, BufRead, Read, Write};
-use std::os::fd::AsFd;
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -9,7 +8,7 @@ use anyhow::{Context, Result, ensure};
 use rustix::fs::{Mode, OFlags, open};
 use serde::{Deserialize, Serialize};
 
-use crate::terminal::{Interrupted, Palette, Tone};
+use crate::terminal::{Interrupted, Palette, TerminalInput, Tone};
 use crate::{adaption::Client, terminal};
 
 pub const DEFAULT_MODEL: &str = "qwen3.5-397b";
@@ -177,58 +176,30 @@ fn valid_key(key: &str) -> bool {
 }
 
 pub fn setup_popup(
-    input: &mut (impl BufRead + AsFd),
+    input: &mut TerminalInput,
     output: &mut impl Write,
     palette: Palette,
 ) -> Result<bool> {
+    writeln!(output, "\n{}", palette.paint(Tone::Info, "╭─ Adapt setup"))?;
     writeln!(
         output,
-        "\n{} {}",
-        palette.paint(Tone::Info, "╭─"),
-        palette.paint(Tone::Text, "Adapt setup")
+        "{} Add your Adaption API key in /settings.",
+        palette.paint(Tone::Info, "│")
     )?;
-    writeln!(
-        output,
-        "{} Add your Adaption API key in {}.",
-        palette.paint(Tone::Info, "│"),
-        palette.paint(Tone::Action, "/settings")
-    )?;
-    writeln!(
-        output,
-        "{} {}     {}",
-        palette.paint(Tone::Info, "│"),
-        palette.paint(Tone::Action, "1. Open /settings"),
-        palette.paint(Tone::Text, "2. Later")
-    )?;
-    writeln!(output, "{}", palette.paint(Tone::Info, "╰─"))?;
-    loop {
-        write!(output, "{}", palette.paint(Tone::Action, "Choose [1]: "))?;
-        output.flush()?;
-        if let Some(choice) = setup_choice(terminal::read_interactive_line(input)?.as_deref()) {
-            return Ok(choice);
-        }
-        writeln!(output, "{}", palette.paint(Tone::Action, "Enter 1 or 2."))?;
-    }
-}
-
-fn setup_choice(input: Option<&str>) -> Option<bool> {
-    match input.map(str::trim) {
-        Some("" | "1" | "/settings") => Some(true),
-        Some("2") | None => Some(false),
-        _ => None,
-    }
+    Ok(terminal::select(input, output, &["Open /settings", "Later"], 0, palette)? == Some(0))
 }
 
 pub fn edit(
     settings: &mut Settings,
     config: &Config,
-    input: &mut (impl BufRead + AsFd),
+    input: &mut TerminalInput,
     output: &mut impl Write,
     model_override: Option<&str>,
     memory_override: Option<bool>,
 ) -> Result<()> {
     let palette = Palette::stderr();
     let mut draft = settings.clone();
+    let mut selected = 0;
     loop {
         let model = draft.model.as_deref().unwrap_or(DEFAULT_MODEL);
         let key_status = if env::var("ADAPTION_API_KEY").is_ok_and(|value| !value.trim().is_empty())
@@ -239,157 +210,81 @@ pub fn edit(
         } else {
             "required"
         };
-        let border = palette.paint(Tone::Info, "│");
-        writeln!(
-            output,
-            "\n{} {}",
-            palette.paint(Tone::Info, "╭─"),
-            palette.paint(Tone::Text, "/settings")
-        )?;
-        let key_tone = if key_status == "required" {
-            Tone::Action
-        } else {
-            Tone::Text
-        };
-        writeln!(
-            output,
-            "{border} {}          {}",
-            palette.paint(key_tone, "1. API key"),
-            palette.paint(key_tone, key_status)
-        )?;
-        writeln!(
-            output,
-            "{border} {}   {}",
-            palette.paint(Tone::Text, "2. Model or stack"),
-            terminal::line(model)
-        )?;
-        writeln!(
-            output,
-            "{border} {}   {}",
-            palette.paint(Tone::Text, "3. Agentic memory"),
-            memory_label(draft.agentic_memory)
-        )?;
-        writeln!(
-            output,
-            "{border} {}",
-            palette.paint(Tone::Text, "4. List available models")
-        )?;
-        writeln!(
-            output,
-            "{border} {}",
-            palette.paint(Tone::Action, "5. Save and return")
-        )?;
-        writeln!(output, "{border} 0. Cancel")?;
+        writeln!(output, "\n{}", palette.paint(Tone::Info, "╭─ /settings"))?;
         if let Some(model) = model_override {
-            writeln!(
-                output,
-                "{border} Session model override: {}",
-                palette.paint(Tone::Info, terminal::line(model))
-            )?;
+            writeln!(output, "Session model override: {}", terminal::line(model))?;
         }
         if let Some(memory) = memory_override {
             writeln!(
                 output,
-                "{border} Session memory override: {}",
-                palette.paint(Tone::Info, memory_label(Some(memory)))
+                "Session memory override: {}",
+                memory_label(Some(memory))
             )?;
         }
-        writeln!(output, "{}", palette.paint(Tone::Info, "╰─"))?;
-
-        write!(output, "{}", palette.paint(Tone::Action, "Choose: "))?;
-        output.flush()?;
-        match terminal::read_interactive_line(input)?
-            .as_deref()
-            .map(str::trim)
-        {
-            Some("1") => {
+        let options = [
+            format!("API key ({key_status})"),
+            format!("Model or stack ({model})"),
+            format!("Agentic memory ({})", memory_label(draft.agentic_memory)),
+            "Save and return".to_owned(),
+            "Cancel".to_owned(),
+        ];
+        let Some(choice) = terminal::select(input, output, &options, selected, palette)? else {
+            return Ok(());
+        };
+        selected = choice;
+        match choice {
+            0 => {
                 writeln!(output, "{KEY_HELP}")?;
-                match terminal::read_hidden_line(
+                if let Some(key) = terminal::read_hidden_line(
                     input,
                     output,
                     &palette.paint(Tone::Action, "API key (input hidden, Enter to keep): "),
                 )? {
-                    Some(key) if !key.trim().is_empty() => {
-                        let key = key.trim();
-                        if valid_key(key) {
-                            draft.api_key = Some(key.to_owned());
-                        } else {
-                            writeln!(
-                                output,
-                                "{}",
-                                palette.paint(
-                                    Tone::Action,
-                                    "Invalid key format. Paste the key from Adaption Settings."
-                                )
-                            )?;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Some("2") => {
-                write!(
-                    output,
-                    "{}",
-                    palette.paint(
-                        Tone::Action,
-                        "Adaption model ID or stack:<slug> (Enter to keep): "
-                    )
-                )?;
-                output.flush()?;
-                if let Some(model) = terminal::read_interactive_line(input)? {
-                    let model = model.trim();
-                    if model.is_empty() {
-                        continue;
-                    }
-                    if let Err(error) = validate_model(model) {
+                    let key = key.trim();
+                    if valid_key(key) {
+                        draft.api_key = Some(key.to_owned());
+                    } else if !key.is_empty() {
                         writeln!(
                             output,
                             "{}",
-                            palette.paint(Tone::Action, terminal::line(&error.to_string()))
+                            palette.paint(
+                                Tone::Action,
+                                "Invalid key format. Paste the key from Adaption Settings."
+                            )
                         )?;
-                        continue;
                     }
-                    draft.model = Some(model.to_owned());
                 }
             }
-            Some("3") => {
+            1 => {
+                if let Some(model) = select_model(&draft, input, output, palette)? {
+                    draft.model = Some(model);
+                }
+            }
+            2 => {
                 writeln!(
                     output,
-                    "For an inference stack, enable memory, disable it, or use the stack's setting."
+                    "\n{}",
+                    palette.paint(Tone::Info, "╭─ Agentic memory for inference stacks")
                 )?;
-                write!(
-                    output,
-                    "{}",
-                    palette.paint(
-                        Tone::Action,
-                        "[1] On  [2] Off  [3] Stack default  [Enter] Keep: "
-                    )
-                )?;
-                output.flush()?;
-                match terminal::read_interactive_line(input)?
-                    .as_deref()
-                    .map(str::trim)
+                let values = [Some(true), Some(false), None];
+                let initial = values
+                    .iter()
+                    .position(|&value| value == draft.agentic_memory)
+                    .unwrap();
+                if let Some(choice) =
+                    terminal::select(input, output, &values.map(memory_label), initial, palette)?
                 {
-                    Some("1") => draft.agentic_memory = Some(true),
-                    Some("2") => draft.agentic_memory = Some(false),
-                    Some("3") => draft.agentic_memory = None,
-                    Some("") | None => {}
-                    _ => writeln!(
-                        output,
-                        "{}",
-                        palette.paint(Tone::Action, "Enter 1, 2, or 3.")
-                    )?,
+                    draft.agentic_memory = values[choice];
                 }
             }
-            Some("4") => show_models(&draft, output, palette)?,
-            Some("5") => {
+            3 => {
                 if draft.key().is_none() {
                     writeln!(
                         output,
                         "{}",
-                        palette.paint(Tone::Action, "Add an API key with option 1 before saving.")
+                        palette.paint(Tone::Action, "Add an API key before saving.")
                     )?;
+                    selected = 0;
                     continue;
                 }
                 if &draft != settings || !config.path().exists() {
@@ -399,8 +294,8 @@ pub fn edit(
                 writeln!(output, "{}", palette.paint(Tone::Info, "Settings saved."))?;
                 return Ok(());
             }
-            Some("0") | None => return Ok(()),
-            _ => writeln!(output, "{}", palette.paint(Tone::Action, "Enter 0–5."))?,
+            4 => return Ok(()),
+            _ => unreachable!(),
         }
     }
 }
@@ -413,37 +308,71 @@ fn memory_label(memory: Option<bool>) -> &'static str {
     }
 }
 
-fn show_models(settings: &Settings, output: &mut impl Write, palette: Palette) -> Result<()> {
-    let Some(key) = settings.key() else {
-        writeln!(
-            output,
-            "{}",
-            palette.paint(Tone::Action, "Add an API key with option 1 first.")
-        )?;
-        return Ok(());
-    };
-    match Client::new(&key).and_then(|client| client.models()) {
-        Ok(models) if models.is_empty() => writeln!(
-            output,
-            "{}",
-            palette.paint(Tone::Action, "No models available to this key.")
-        )?,
-        Ok(models) => {
-            for model in models {
-                writeln!(output, "  {}", terminal::line(&model))?;
+fn select_model(
+    settings: &Settings,
+    input: &mut TerminalInput,
+    output: &mut impl Write,
+    palette: Palette,
+) -> Result<Option<String>> {
+    writeln!(
+        output,
+        "\n{}",
+        palette.paint(Tone::Info, "╭─ Model or stack")
+    )?;
+    let models = if let Some(key) = settings.key() {
+        writeln!(output, "Loading available models…")?;
+        output.flush()?;
+        match Client::new(&key).and_then(|client| client.models()) {
+            Ok(models) => models,
+            Err(error) if error.is::<Interrupted>() => return Err(error),
+            Err(_) => {
+                writeln!(
+                    output,
+                    "Could not load available models. Check your key or enter a model ID manually."
+                )?;
+                Vec::new()
             }
         }
-        Err(error) if error.is::<Interrupted>() => return Err(error),
-        Err(_) => writeln!(
-            output,
-            "{}",
-            palette.paint(
-                Tone::Action,
-                "Could not list models. Check your API key and connection."
-            )
-        )?,
+    } else {
+        writeln!(output, "Add an API key to see available models.")?;
+        Vec::new()
+    };
+    let current = settings.model.as_deref().unwrap_or(DEFAULT_MODEL);
+    let models = available_models(models, current);
+    let mut options = vec![
+        format!("{current} (current)"),
+        "Enter a model ID or stack manually".into(),
+    ];
+    options.extend(models.iter().cloned());
+    match terminal::select(input, output, &options, 0, palette)? {
+        None | Some(0) => Ok(None),
+        Some(1) => {
+            write!(
+                output,
+                "Adaption model ID or stack:<slug> (Enter to keep): "
+            )?;
+            output.flush()?;
+            let value = terminal::read_interactive_line(input)?;
+            let Some(model) = value
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+            else {
+                return Ok(None);
+            };
+            if let Err(error) = validate_model(model) {
+                writeln!(output, "{}", palette.paint(Tone::Action, error))?;
+                return Ok(None);
+            }
+            Ok(Some(model.to_owned()))
+        }
+        Some(choice) => Ok(Some(models[choice - 2].clone())),
     }
-    Ok(())
+}
+
+fn available_models(mut models: Vec<String>, current: &str) -> Vec<String> {
+    models.retain(|model| model != current && validate_model(model).is_ok());
+    models
 }
 
 #[cfg(test)]
@@ -479,10 +408,11 @@ mod tests {
     }
 
     #[test]
-    fn popup_accepts_default_and_later() {
-        assert_eq!(setup_choice(Some("")), Some(true));
-        assert_eq!(setup_choice(Some("2")), Some(false));
-        assert_eq!(setup_choice(Some("9")), None);
+    fn model_options_exclude_the_current_model_and_invalid_ids() {
+        let models = ["alpha", DEFAULT_MODEL, "invalid id", "stack:", "zeta"]
+            .map(str::to_owned)
+            .to_vec();
+        assert_eq!(available_models(models, DEFAULT_MODEL), ["alpha", "zeta"]);
     }
 
     #[test]
