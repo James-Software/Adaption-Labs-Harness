@@ -105,6 +105,9 @@ impl<'a> Agent<'a> {
             if let Some(memory) = self.memory {
                 request["agentic_memory"] = json!(memory);
             }
+            if self.model.starts_with("stack:") {
+                request["self_improvement"] = json!(false);
+            }
 
             tools::check_interrupt()?;
             let mut streamed = false;

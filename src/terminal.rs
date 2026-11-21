@@ -227,3 +227,15 @@ fn escape(text: &str, multiline: bool) -> String {
     }
     escaped
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escapes_controls_and_bidi_marks_in_untrusted_text() {
+        let input = "café\t\n\x1b[0m\r\u{202e}text";
+        assert_eq!(visible(input), "café\t\n\\u{1b}[0m\\u{d}\\u{202e}text");
+        assert_eq!(line(input), "café\\u{9}\\u{a}\\u{1b}[0m\\u{d}\\u{202e}text");
+    }
+}

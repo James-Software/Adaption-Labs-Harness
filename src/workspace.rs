@@ -68,10 +68,8 @@ impl Workspace {
         .canonicalize()
         .context("resolving the workspace")?;
         ensure!(
-            !root.iter().any(|part| part
-                .to_str()
-                .is_some_and(|name| name.eq_ignore_ascii_case(".adaption-code"))),
-            "select a project outside the Adaption settings directory"
+            root.iter().filter_map(OsStr::to_str).all(allowed),
+            "select a project outside protected directories"
         );
         let dir =
             Dir::open_ambient_dir(&root, ambient_authority()).context("opening the workspace")?;
@@ -578,6 +576,58 @@ mod tests {
         assert!(ws.apply(&edit).is_err());
         assert!(ws.create_directory(&directory).is_err());
         assert_eq!(fs::read_dir(src).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn protected_directories_cannot_be_selected_as_workspaces() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [".git", ".SSH", ".aws", ".adaption-code"] {
+            let protected = root.path().join(name);
+            let nested = protected.join("nested");
+            fs::create_dir_all(&nested).unwrap();
+            assert!(Workspace::open(Some(protected)).is_err(), "{name}");
+            assert!(Workspace::open(Some(nested)).is_err(), "{name}");
+        }
+        let alias = root.path().join("alias");
+        symlink(root.path().join(".git"), &alias).unwrap();
+        assert!(Workspace::open(Some(alias)).is_err());
+        assert!(Workspace::open(Some(root.path().into())).is_ok());
+    }
+
+    #[test]
+    fn edit_preserves_permissions_and_refuses_concurrent_metadata_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(Some(root.path().into())).unwrap();
+        let path = root.path().join("script");
+        fs::write(&path, "original\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let first = ws
+            .prepare_edit("script", Some("original"), "updated")
+            .unwrap();
+        ws.apply(&first).unwrap();
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o755);
+        let second = ws.prepare_edit("script", Some("updated"), "new").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(ws.apply(&second).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "updated\n");
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn rejects_binary_oversized_and_out_of_range_reads() {
+        let root = tempfile::tempdir().unwrap();
+        let ws = Workspace::open(Some(root.path().into())).unwrap();
+        fs::write(root.path().join("binary"), [0, 1]).unwrap();
+        fs::write(root.path().join("invalid"), [0xff]).unwrap();
+        fs::write(root.path().join("large"), vec![b'x'; MAX_FILE + 1]).unwrap();
+        fs::write(root.path().join("text"), "one\ntwo\n").unwrap();
+        for path in ["binary", "invalid", "large"] {
+            assert!(ws.read(path, 1, 1).is_err(), "{path}");
+        }
+        for (start, end) in [(0, 1), (2, 1), (1, 201)] {
+            assert!(ws.read("text", start, end).is_err());
+        }
+        assert_eq!(ws.read("text", 2, 2).unwrap(), "2: two\n");
     }
 
     #[test]

@@ -63,9 +63,8 @@ impl Client {
             let response = self
                 .send(self.http.get(format!("{}/models", self.base)))
                 .await?;
-            let mut models: Vec<_> = response
-                .json::<ModelList>()
-                .await?
+            let body = read_body(response, MAX_EVENT).await?;
+            let mut models: Vec<_> = serde_json::from_slice::<ModelList>(&body)?
                 .data
                 .into_iter()
                 .map(|model| model.id)
@@ -104,11 +103,14 @@ impl Client {
                 "expected an Adaption event stream"
             );
             let mut stream = EventStream::default();
+            let mut received = 0;
             while let Some(chunk) = response
                 .chunk()
                 .await
                 .context("reading Adaption event stream")?
             {
+                received += chunk.len();
+                ensure!(received <= MAX_STREAM, "Adaption event stream is too large");
                 if let Some(response) = stream.push(&chunk, &mut on_text)? {
                     return Ok(response);
                 }
@@ -147,6 +149,7 @@ impl Client {
 }
 
 const MAX_EVENT: usize = 2 * 1024 * 1024;
+const MAX_STREAM: usize = 4 * MAX_EVENT;
 
 async fn interruptible<T>(
     request: impl Future<Output = Result<T>>,
@@ -280,8 +283,35 @@ fn failure(value: &Value) -> &str {
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::thread;
+
+    fn read_mock_request(socket: &TcpStream, expected_request: &str) -> Vec<u8> {
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut input = BufReader::new(socket);
+        let mut line = String::new();
+        input.read_line(&mut line).unwrap();
+        assert_eq!(line.trim_end(), expected_request);
+        let mut content_length = 0;
+        let mut authorized = false;
+        loop {
+            line.clear();
+            assert_ne!(input.read_line(&mut line).unwrap(), 0);
+            if line == "\r\n" {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("content-length:") {
+                content_length = value.trim().parse().unwrap();
+            }
+            authorized |= line.trim_end() == "authorization: Bearer test-key";
+        }
+        assert!(authorized);
+        let mut body = vec![0; content_length];
+        input.read_exact(&mut body).unwrap();
+        body
+    }
 
     #[test]
     fn response_and_tool_output_round_trip() {
@@ -290,29 +320,11 @@ mod tests {
         let server = thread::spawn(move || {
             for round in 0..2 {
                 let (mut socket, _) = listener.accept().unwrap();
-                let mut input = BufReader::new(&socket);
-                let mut request = String::new();
-                input.read_line(&mut request).unwrap();
-                assert_eq!(request.trim_end(), "POST /responses HTTP/1.1");
-                let mut length = 0;
-                let mut authorized = false;
-                loop {
-                    let mut line = String::new();
-                    input.read_line(&mut line).unwrap();
-                    if line == "\r\n" || line.is_empty() {
-                        break;
-                    }
-                    if let Some(value) = line.strip_prefix("content-length:") {
-                        length = value.trim().parse().unwrap();
-                    }
-                    authorized |= line.trim_end() == "authorization: Bearer test-key";
-                }
-                assert!(authorized);
-                let mut body = vec![0; length];
-                input.read_exact(&mut body).unwrap();
+                let body = read_mock_request(&socket, "POST /responses HTTP/1.1");
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 assert_eq!(body["model"], "stack:coder");
                 assert_eq!(body["agentic_memory"], true);
+                assert_eq!(body["self_improvement"], false);
                 assert_eq!(body["store"], false);
                 assert_eq!(body["stream"], true);
                 assert!(
@@ -415,5 +427,129 @@ mod tests {
             .push(&event.as_bytes()[split..], &mut on_text)
             .unwrap();
         assert_eq!(text, "café");
+    }
+
+    fn mock_reply(
+        expected_request: &'static str,
+        status: &'static str,
+        headers: &'static str,
+        body: Vec<u8>,
+    ) -> (Client, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            read_mock_request(&socket, expected_request);
+            write!(
+                socket,
+                "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            if let Err(error) = socket.write_all(&body) {
+                // The client can stop reading once it has rejected an oversized response.
+                assert!(matches!(
+                    error.kind(),
+                    std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset
+                ));
+            }
+        });
+        let client = Client::with_base(&format!("http://{address}"), "test-key").unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn models_returns_sorted_unique_ids() {
+        let (client, server) = mock_reply(
+            "GET /models HTTP/1.1",
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            br#"{"data":[{"id":"z"},{"id":"a"},{"id":"z"}]}"#.to_vec(),
+        );
+        assert_eq!(client.models().unwrap(), ["a", "z"]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn models_rejects_an_oversized_body() {
+        let (client, server) = mock_reply(
+            "GET /models HTTP/1.1",
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            vec![b' '; MAX_EVENT + 1],
+        );
+        let error = client.models().unwrap_err();
+        assert!(error.to_string().contains("too large"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn streaming_limits_the_total_bytes_received() {
+        let mut body = b": heartbeat\n\n".repeat(MAX_STREAM / b": heartbeat\n\n".len() + 1);
+        body.extend_from_slice(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n",
+        );
+        let (client, server) = mock_reply(
+            "POST /responses HTTP/1.1",
+            "200 OK",
+            "Content-Type: text/event-stream\r\n",
+            body,
+        );
+        let reply = client.respond(&serde_json::json!({}), |_| Ok(()));
+        assert!(
+            matches!(reply, Err(error) if error.to_string().contains("event stream is too large"))
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn redirects_are_rejected() {
+        let (client, server) = mock_reply(
+            "GET /models HTTP/1.1",
+            "307 Temporary Redirect",
+            "Location: /other\r\n",
+            Vec::new(),
+        );
+        assert!(
+            client
+                .models()
+                .unwrap_err()
+                .to_string()
+                .contains("HTTP 307")
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn duplicate_calls_and_call_budget_fail_closed() {
+        let call = |id: String| {
+            serde_json::json!({
+                "type": "function_call",
+                "name": "list_files",
+                "call_id": id,
+                "arguments": "{}",
+            })
+        };
+        for (calls, expected) in [
+            (vec![call("same".into()); 2], "duplicate tool call ID"),
+            (
+                (0..33).map(|id| call(id.to_string())).collect(),
+                "tool-call limit",
+            ),
+        ] {
+            let (client, server) = mock_reply(
+                "POST /responses HTTP/1.1",
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                serde_json::to_vec(&serde_json::json!({"status":"completed","output":calls}))
+                    .unwrap(),
+            );
+            let root = tempfile::tempdir().unwrap();
+            let workspace = crate::workspace::Workspace::open(Some(root.path().into())).unwrap();
+            let mut agent = crate::agent::Agent::new(client, "hosted".into(), None, &workspace);
+            let error = agent.run("List files.", &mut Vec::new()).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+            server.join().unwrap();
+        }
     }
 }

@@ -449,6 +449,7 @@ fn show_models(settings: &Settings, output: &mut impl Write, palette: Palette) -
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn saves_private_json_and_reloads_settings() {
@@ -482,5 +483,67 @@ mod tests {
         assert_eq!(setup_choice(Some("")), Some(true));
         assert_eq!(setup_choice(Some("2")), Some(false));
         assert_eq!(setup_choice(Some("9")), None);
+    }
+
+    #[test]
+    fn rejects_settings_with_public_modes_or_links() {
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            directory: home.path().join(".adaption-code"),
+        };
+        config.save(&Settings::default()).unwrap();
+        let path = config.path();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(config.load().is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = home.path().join("other.json");
+        fs::hard_link(&path, &link).unwrap();
+        assert!(config.load().is_err());
+        fs::remove_file(&path).unwrap();
+        symlink(&link, &path).unwrap();
+        assert!(config.load().is_err());
+
+        let old = home.path().join("old-config");
+        fs::rename(&config.directory, &old).unwrap();
+        symlink(&old, &config.directory).unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+        fs::remove_file(&config.directory).unwrap();
+        fs::rename(old, &config.directory).unwrap();
+        fs::set_permissions(&config.directory, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(config.load().is_err());
+        assert!(config.save(&Settings::default()).is_err());
+    }
+
+    #[test]
+    fn malformed_settings_do_not_echo_values() {
+        let home = tempfile::tempdir().unwrap();
+        let config = Config {
+            directory: home.path().join(".adaption-code"),
+        };
+        config.save(&Settings::default()).unwrap();
+        fs::write(config.path(), r#"{"api_key":"fixture-key","model":false}"#).unwrap();
+        let error = config.load().err().expect("invalid configuration");
+        assert!(format!("{error:#}").contains("invalid settings JSON"));
+        assert!(!format!("{error:#}").contains("fixture-key"));
+    }
+
+    #[test]
+    fn validates_model_and_memory_overrides() {
+        let settings = Settings {
+            api_key: Some("fixture-key".into()),
+            model: Some("stack:coder".into()),
+            agentic_memory: Some(true),
+        };
+        let connection = settings.connection(None, Some(false)).unwrap().unwrap();
+        assert_eq!(connection.model, "stack:coder");
+        assert_eq!(connection.memory, Some(false));
+        let connection = settings.connection(Some("hosted"), None).unwrap().unwrap();
+        assert_eq!(connection.model, "hosted");
+        assert_eq!(connection.memory, None);
+        assert!(settings.connection(Some("hosted"), Some(true)).is_err());
+        for model in ["", "has space", "stack:", "escape\x1b"] {
+            assert!(settings.connection(Some(model), None).is_err());
+        }
     }
 }

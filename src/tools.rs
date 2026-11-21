@@ -460,4 +460,93 @@ mod tests {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn noninteractive_tools_require_approval_and_commands_can_be_cancelled() {
+        const FIXTURE: &str = "ADAPT_TEST_DETACHED";
+        if env::var_os(FIXTURE).is_none() {
+            let mut test = Command::new(env::current_exe().unwrap());
+            test.args([
+                "--exact",
+                "tools::tests::noninteractive_tools_require_approval_and_commands_can_be_cancelled",
+                "--nocapture",
+            ])
+            .env(FIXTURE, "1")
+            .env("ADAPTION_API_KEY", "fixture-key")
+            .stdin(Stdio::null());
+            // The child starts a fresh session before exec, without a controlling tty.
+            unsafe {
+                test.pre_exec(|| rustix::process::setsid().map(|_| ()).map_err(Into::into));
+            }
+            let output = test.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&output.stderr)
+                    .matches("Denied: no controlling terminal")
+                    .count(),
+                3
+            );
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(Some(root.path().into())).unwrap();
+        let mut approvals = Approvals::default();
+        for (tool, args) in [
+            (
+                "edit_file",
+                r#"{"path":"file","old_text":null,"new_text":"fixture"}"#,
+            ),
+            ("create_directory", r#"{"path":"directory"}"#),
+            (
+                "run_command",
+                r#"{"program":"/usr/bin/touch","args":["marker"]}"#,
+            ),
+        ] {
+            assert_eq!(
+                run(tool, args, &workspace, &mut approvals).unwrap()["status"],
+                "denied"
+            );
+        }
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
+
+        // A command that is authorized elsewhere still gets no API key in its environment.
+        let child = spawn(
+            Path::new("/usr/bin/printenv"),
+            "printenv",
+            &["ADAPTION_API_KEY".into()],
+            root.path(),
+        )
+        .unwrap();
+        assert_eq!(child["exit_code"], 1);
+        assert_eq!(child["stdout"], "");
+
+        install_interrupt_handler().unwrap();
+        let signal = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(150));
+            rustix::process::kill_process(rustix::process::getpid(), Signal::INT).unwrap();
+        });
+        let child = spawn(Path::new("/bin/sleep"), "sleep", &["5".into()], root.path()).unwrap();
+        signal.join().unwrap();
+        assert_eq!(child["status"], "error");
+        assert_eq!(child["reason"], "interrupted");
+    }
+
+    #[test]
+    fn captured_output_is_bounded_and_handles_non_utf8() {
+        use std::io::Write;
+
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[0xff]).unwrap();
+        file.write_all(&vec![b'x'; MAX_CAPTURE as usize]).unwrap();
+        let output = capture(&mut file).unwrap();
+        let contents = output.strip_suffix("\n[output truncated]").unwrap();
+        assert!(contents.starts_with('\u{fffd}'));
+        assert_eq!(contents.chars().count() as u64, MAX_CAPTURE);
+    }
 }
